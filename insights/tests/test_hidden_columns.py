@@ -104,10 +104,10 @@ class TestHiddenColumns(InsightsIntegrationTestCase):
         reader = create_test_query(ADMIN, self.workbook, title="Reads Hidden Columns", operations=operations)
         with as_user(ADMIN):
             result = reader.execute(force=True)
-            offered = reader.get_columns_for_selection()
+            selectable = reader.get_columns_for_selection()
         by_name = {c["name"]: c for c in result["columns"]}
         self.assertTrue(by_name["todos__currency"].get("hidden"))
-        self.assertNotIn("todos__currency", [c["name"] for c in offered])
+        self.assertNotIn("todos__currency", [c["name"] for c in selectable])
 
     # @feature query.summarize-currency-carried
     def test_a_carried_column_is_marked_and_its_value_still_rides_in_the_row(self):
@@ -120,22 +120,22 @@ class TestHiddenColumns(InsightsIntegrationTestCase):
         self.assertNotIn(None, result["currency_symbols"])
 
     # @feature query.summarize-currency-carried
-    def test_a_group_holding_a_row_without_a_code_carries_none(self):
+    def test_a_group_holding_a_row_without_a_code_holds_none(self):
         # min and max skip nulls, so a null row must void the group on its own
         _, by_status = self.carried()
         self.assertIsNone(by_status["Closed"])
 
     # @feature query.summarize-currency-carried
-    def test_a_carried_column_is_not_offered_to_the_author(self):
+    def test_a_carried_column_is_not_listed_for_the_author(self):
         with as_user(ADMIN):
-            offered = frappe.get_doc(DT.QUERY, self.query).get_columns_for_selection()
-        names = [c["name"] for c in offered]
+            selectable = frappe.get_doc(DT.QUERY, self.query).get_columns_for_selection()
+        names = [c["name"] for c in selectable]
         self.assertIn("todos", names)
         self.assertNotIn("todos__currency", names)
 
     # @feature query.summarize-currency-carried
-    def test_a_currency_column_that_is_gone_carries_none_rather_than_failing(self):
-        # a missing column must not fail the query, and it carries null, not the site currency
+    def test_a_currency_column_that_is_gone_holds_none_rather_than_failing(self):
+        # a missing column must not fail the query, and it holds null, not the site currency
         operations = copy.deepcopy(OPERATIONS)
         operations[-1]["measures"][0]["currency_column"] = "no_such_column"
         query = create_test_query(ADMIN, self.workbook, title="Missing Currency", operations=operations)
@@ -151,3 +151,43 @@ class TestHiddenColumns(InsightsIntegrationTestCase):
         header = csv.splitlines()[0].split(",")
         self.assertIn("todos", header)
         self.assertNotIn("todos__currency", header)
+
+    # @feature query.summarize-currency-carried
+    def test_a_carried_column_does_not_leave_in_an_export_from_the_data_store(self):
+        rows = [
+            {"status": "Open", "kind": "Bug", "amount": 5, "currency": "INR"},
+            {"status": "Closed", "kind": "Task", "amount": 7, "currency": "USD"},
+        ]
+        operations = [
+            {"type": "code", "code": f"results = {rows}"},
+            {
+                "type": "summarize",
+                "measures": [
+                    {
+                        "measure_name": "total",
+                        "column_name": "amount",
+                        "data_type": "Integer",
+                        "aggregation": "sum",
+                        "format": "currency",
+                        "currency_column": "currency",
+                    },
+                    {
+                        "measure_name": "todos",
+                        "column_name": "amount",
+                        "data_type": "Integer",
+                        "aggregation": "count",
+                    },
+                ],
+                "dimensions": [
+                    {"dimension_name": "status", "column_name": "status", "data_type": "String"},
+                    {"dimension_name": "kind", "column_name": "kind", "data_type": "String"},
+                ],
+            },
+        ]
+        query = create_test_query(ADMIN, self.workbook, title="Stored Hidden Columns", operations=operations)
+        query.db_set("use_live_connection", 0)
+        frappe.db.set_single_value("Insights Settings", "allow_download", 1)
+        with as_user(ADMIN):
+            csv = frappe.get_doc(DT.QUERY, query.name).download_results(format="csv")
+        header = csv.splitlines()[0].split(",")
+        self.assertEqual(sorted(header), ["kind", "status", "todos", "total"])

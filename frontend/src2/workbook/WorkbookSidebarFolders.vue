@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Folder, FolderOpen, FolderPlus, PenLine, Plus, X } from 'lucide-vue-next'
-import { computed, inject, ref } from 'vue'
+import { computed, inject, ref, watch } from 'vue'
 import Draggable from 'vuedraggable'
 import type { WorkbookChart, WorkbookFolder, WorkbookQuery } from '../types/workbook.types'
 import { setDraggedItem } from './workbook_drag'
@@ -20,7 +20,7 @@ const section = defineProps<{
 
 const workbook = inject(workbookKey)!
 
-// Sortable owns the dragstart on these rows, so the payload a row carries out
+// Sortable owns the dragstart on these rows, so the payload a row takes out
 // of the sidebar is written through Sortable's own `setData`. The row it hands
 // back is an element; `data-name` is what names the item again.
 function setDragData(dataTransfer: DataTransfer, row: HTMLElement) {
@@ -71,6 +71,15 @@ function toggleFolder(folder: WorkbookFolder) {
 	}
 }
 
+// Keyed on the item, not its folder, so dropping the open item into a
+// collapsed folder leaves the folder collapsed.
+const activeItem = computed(() => section.items.find((item) => section.isActive(item)))
+watch(
+	() => activeItem.value?.name,
+	() => activeItem.value?.folder && expandedFolders.value.add(activeItem.value.folder),
+	{ immediate: true },
+)
+
 function isFolderExpanded(folderName: string) {
 	return expandedFolders.value.has(folderName)
 }
@@ -112,7 +121,7 @@ function finishRenameFolder(folder: WorkbookFolder) {
 // (shared) item objects so the computeds re-derive without a snap-back, and
 // persist. A cross-list move fires `removed` on the source and `added` on the
 // target; we persist only from the `added` (and same-list `moved`) side, which
-// already carries the moved item with its new folder. The `removed` side is
+// already includes the moved item with its new folder. The `removed` side is
 // ignored so we don't issue a second, racing write for the source list.
 function onListChange(
 	currentList: (WorkbookQuery | WorkbookChart)[],

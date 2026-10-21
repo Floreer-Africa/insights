@@ -24,7 +24,7 @@ posting_date | grand_total
 
 The start dates sort the rows oldest first, and the label is a real period key a target can join on. The group is the span, not the unit it names: `last 3 months` grouped by month returns three rows, and the card would show August as the three-month total.
 
-**The engine resolves the span.** Derived operations carry `month to date`, never dates. `get_window` resolves it while the query runs, where the clock and the fiscal calendar are. A comparison is the same span recomputed from a moved anchor (`shift_anchor`), so the previous span above is Aug 1–14, not all of August. Resolving earlier would derive different operations tomorrow.
+**The engine resolves the span.** Derived operations hold `month to date`, never dates. `get_window` resolves it while the query runs, where the clock and the fiscal calendar are. A comparison is the same span recomputed from a moved anchor (`shift_anchor`), so the previous span above is Aug 1–14, not all of August. Resolving earlier would derive different operations tomorrow.
 
 **Each span is its own aggregate.** `aggregate_by_window` filters and aggregates once per span and unions the rows. Spans that overlap both count the rows they share: `last 3 months` against the same span a month back share June and July, and neither reads short.
 
@@ -44,3 +44,18 @@ The start dates sort the rows oldest first, and the label is a real period key a
 ## Consequences
 
 A summarize grouped by spans can group by nothing else. A second dimension would split each span again, so `aggregate_by_window` throws.
+
+## A card with no Period reads the dashboard's span
+
+Date: 2026-10-06
+
+### Decision
+
+A card that states no Period, on a dashboard whose `within` filter is the only filter routed to its date column on its own query, reads that filter's span as its Period. `take_dashboard_period` writes the span into the chart's config where routed filters meet the chart: `view.routed_chart` for a View, `authoring.drilled_shape` for the Builder. Derivation, the comparison rows, the sparkline, the drill and the card's labels all read that one config. The filter then no longer applies to that card as a row filter, because it would drop the comparison spans.
+
+A card that states its own Period keeps it, and the filter still narrows its rows. A `between` range, any other operator, a link to a query the chart's query reads, and a span beside any other filter on the same column all stay row filters, because that filter would cut the comparison spans again. A span is the only Period a dashboard lends.
+
+### Consequences
+
+A card's operations now depend on the dashboard it is read on, not on its config alone. The View sends the effective config as the card's `chart`. The Builder renders the config it edits, so it gets the lent span beside the rows as `period`, and the store overlays it without writing it into the edited config.
+

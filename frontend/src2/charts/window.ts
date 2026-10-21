@@ -9,7 +9,7 @@
 //
 // One module owns the vocabulary. A span is a string the server's `get_window`
 // parses, and nothing outside this file builds one — a span it cannot parse
-// raises while the card runs, so the choices an author is offered and the
+// raises while the card runs, so the choices an author is shown and the
 // strings they write have to be the same list.
 
 import dayjs from 'dayjs'
@@ -73,8 +73,12 @@ export function windowPeriods(span: WindowSpan): number {
 }
 
 /**
- * The shift that names the span before this one: the same span, moved back by
- * its own length, so the two spans meet and never overlap.
+ * What a `previous` comparison over this span is called.
+ *
+ * The span before this one is the same span, moved back by its own length, so
+ * the two meet and never overlap. A span of whole periods is named by those
+ * periods, as a grain's previous period is. A to-date span stops partway into
+ * its period, so the stretch before it is the same part of the period before.
  *
  * Only the caption reads this. Which row a comparison is answered from is the
  * server's word — it resolves the span while the query runs, which is the one
@@ -83,10 +87,15 @@ export function windowPeriods(span: WindowSpan): number {
  * `_comparison_shift` in `chart_query.py` is the same derivation, and the two
  * have to agree on every span `get_window` accepts.
  */
-export function previousWindowShift(span?: string): WindowShift | undefined {
+export function previousWindowLabel(span?: string): string | undefined {
 	const parsed = parseWindowSpan(span)
 	if (!parsed) return undefined
-	return { unit: parsed.unit, count: -windowPeriods(parsed) }
+	if (parsed.shape === 'to date') return windowShiftLabel({ unit: parsed.unit, count: -1 })
+
+	const periods = windowPeriods(parsed)
+	return periods === 1
+		? __('vs previous {0}', windowUnitLabel(parsed.unit))
+		: __('vs previous {0} {1}', String(periods), windowUnitLabel(parsed.unit, true))
 }
 
 /** The period a card reads. One of `span` or `grain`, plus an optional anchor. */
@@ -129,7 +138,7 @@ export function lastSpanSentence(unit: WindowUnit, count: number): [string, stri
 /**
  * What the include-current toggle adds, worded as the choice that names it.
  *
- * "Include this month" is the option label `current:month` carries, so the
+ * "Include this month" is the option label `current:month` has, so the
  * toggle names the exact period it extends the run over. A day has no "this
  * day" in English, and its option is called Today.
  */
@@ -221,6 +230,18 @@ export function periodOf(config: NumberChartConfig): NumberPeriod | undefined {
 }
 
 /**
+ * The chart as the server read it: with the Period a dashboard lent it, when it
+ * is a Number chart that states none of its own.
+ */
+export function withLentPeriod<T extends { chart_type: string; config: any }>(
+	chart: T,
+	period?: NumberPeriod,
+): T {
+	if (!period || chart.chart_type !== 'Number' || periodOf(chart.config)) return chart
+	return { ...chart, config: { ...chart.config, window: period } }
+}
+
+/**
  * The choice a period was written by, or the period itself when nothing here
  * wrote it. Empty when the card reads no period, which the picker shows as its
  * placeholder — there is no "None" to pick, because a date column that groups
@@ -230,7 +251,7 @@ export function choiceOfPeriod(period?: NumberPeriod): string {
 	if (period?.grain) {
 		const choice = `${GRAIN}${grainUnit(period.grain)}`
 		// A grain with no choice of its own still echoes as a grain: the picker
-		// offers back what it was handed, and what comes back must write the shape
+		// lists back what it was handed, and what comes back must write the shape
 		// it was read from. Unprefixed, an hourly card reopened as `{span: 'hour'}`
 		// and the server refused the span.
 		return choice in choiceCopy() ? choice : `${GRAIN}${period.grain}`
@@ -257,7 +278,7 @@ export const DEFAULT_CHOICE = 'to date:month'
  * The period a choice writes, over the run length the author already set.
  *
  * Built whole rather than merged, so switching between the two families cannot
- * leave the old family's key behind — a period carrying both would group twice.
+ * leave the old family's key behind — a period with both would group twice.
  */
 export function periodOfChoice(choice: string, current?: NumberPeriod): NumberPeriod | undefined {
 	if (!choice) return undefined
@@ -311,7 +332,7 @@ const UNIT_STEPS: Record<WindowUnit, [number, 'day' | 'week' | 'month' | 'year']
 /**
  * The stretch a span covers, from the date it starts on.
  *
- * A span is grouped by membership, so its dimension carries no granularity
+ * A span is grouped by membership, so its dimension has no granularity
  * and its start date prints raw. The span is what says how long it is,
  * so the span is what names it — and a span of several periods is named by the
  * whole run, because the first period alone reads as that period's own number.
@@ -332,7 +353,7 @@ export function formatWindowLabel(span: string, start: any): any {
 }
 
 /**
- * The rows a card draws, with its period column read as a period rather than as
+ * The rows a card renders, with its period column read as a period rather than as
  * the date the period starts on.
  */
 export function labelWindowRows(
@@ -352,19 +373,8 @@ export function labelWindowRows(
 	)
 }
 
-/** What a shifted span is called, when the author did not word it themselves. */
+/** What the same stretch one period back is called, when the author did not word it themselves. */
 export function windowShiftLabel(shift?: WindowShift): string | undefined {
-	if (!shift?.count || !WINDOW_UNITS.includes(shift.unit as WindowUnit)) return undefined
-
-	const away = Math.abs(shift.count)
-	const worded = windowUnitLabel(shift.unit as WindowUnit, away > 1)
-
-	if (shift.count < 0) {
-		return away === 1
-			? __('vs same period last {0}', worded)
-			: __('vs same period {0} {1} ago', String(away), worded)
-	}
-	return away === 1
-		? __('vs same period next {0}', worded)
-		: __('vs same period {0} {1} ahead', String(away), worded)
+	if (shift?.count !== -1 || !WINDOW_UNITS.includes(shift.unit as WindowUnit)) return undefined
+	return __('vs same period last {0}', windowUnitLabel(shift.unit as WindowUnit, false))
 }

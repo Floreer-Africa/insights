@@ -3,7 +3,8 @@
 // picker: a Filter button, and the stages that let the reader choose a column,
 // an operator and a value, with the applied filters on an overview stage
 // inside. With `column` the column is already chosen, the trigger names it,
-// opening lands on the operator stage, and the model holds at most one filter.
+// and the model holds at most one filter. Opening lands on the values of the
+// default operator, with the operators one step back.
 import { Badge, Button, Popover } from 'frappe-ui'
 import { ListFilter, X } from 'lucide-vue-next'
 import { computed } from 'vue'
@@ -20,7 +21,7 @@ import FilterPickerPanel from './FilterPickerPanel.vue'
 const props = defineProps<{
 	columns: QueryResultColumn[]
 	valuesProvider: (column: QueryResultColumn) => (search: string) => Promise<string[]>
-	/** The smallest and largest a numeric column goes, for the presets it offers. */
+	/** The smallest and largest a numeric column goes, for the presets it lists. */
 	rangeProvider?: (column: QueryResultColumn) => Promise<[number, number] | undefined>
 	column?: QueryResultColumn
 }>()
@@ -32,6 +33,10 @@ defineSlots<{
 
 // a host may bind `v-model:open`, e.g. to keep a hover-revealed toolbar shown while the popover is up
 const open = defineModel<boolean>('open', { default: false })
+
+function toggle() {
+	open.value = !open.value
+}
 
 const count = computed(() => model.value.length)
 /** the column mount holds at most one filter, and its trigger reads it */
@@ -70,7 +75,7 @@ const valueText = computed(() => {
 <template>
 	<div class="inline-flex">
 		<Popover v-model:open="open" bare :align="column ? 'start' : 'end'" :offset="4">
-			<template #trigger="{ toggle }">
+			<template #trigger>
 				<slot name="trigger" :filter="filter" :open="open" :toggle="toggle">
 					<Button v-if="column" variant="subtle" :class="count ? '' : 'text-ink-gray-5'">
 						<template #prefix>

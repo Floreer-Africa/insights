@@ -1,23 +1,38 @@
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager, suppress
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
 import frappe
 import ibis
 import pandas as pd
-from duckdb import IOException
+import pyarrow as pa
+from duckdb import ConversionException, IOException
+from frappe.utils import add_to_date
+from ibis.backends.duckdb import Backend as DuckDBBackend
 
 import insights
-from insights.insights.doctype.insights_data_source_v3.connectors.duckdb import open_local_duckdb
+from insights.api.data_store import sync_tables
+from insights.insights.doctype.insights_data_source_v3.connectors import duckdb as duckdb_connector
+from insights.insights.doctype.insights_data_source_v3.connectors.duckdb import (
+    connect_duckdb,
+    get_default_memory_limit,
+    get_memory_limit,
+    open_local_duckdb,
+)
 from insights.insights.doctype.insights_data_source_v3.data_warehouse import (
     WarehouseTable,
     WarehouseTableImporter,
     WarehouseTableWriter,
 )
+from insights.insights.doctype.insights_table_v3.insights_table_v3 import get_table_name
 from insights.tests.base import InsightsIntegrationTestCase
 
 # A reader in this process shares the DuckDB instance, so it never conflicts.
@@ -145,6 +160,16 @@ class TestWarehouse(InsightsIntegrationTestCase):
             )
 
     # @feature data-store.import-table
+    def test_writer_append_mode_keeps_rows_of_a_table_named_with_regex_characters(self):
+        with self.patched_warehouse() as db:
+            table = "orders_(eu)"
+            self.write_to_table(db, table, [{"id": 1, "value": "alpha", "modified": "2024-01-01 00:00:00"}])
+            self.write_to_table(
+                db, table, [{"id": 2, "value": "beta", "modified": "2024-01-02 00:00:00"}], mode="append"
+            )
+            self.assertEqual([row["id"] for row in self.read_rows(db, table)], [1, 2])
+
+    # @feature data-store.import-table
     def test_writer_upsert_mode_updates_matching_primary_keys(self):
         with self.patched_warehouse() as db:
             self.write_to_table(db, "t", [{"id": 1, "value": "alpha", "modified": "2024-01-01 00:00:00"}])
@@ -168,6 +193,41 @@ class TestWarehouse(InsightsIntegrationTestCase):
                     {"id": 2, "value": "beta", "modified": "2024-01-02 00:00:00"},
                 ],
             )
+
+    def schema_tables(self, db, schema="main"):
+        query = "select table_name from duckdb_tables() where database_name = current_database() and schema_name = ?"
+        return {name for (name,) in db.raw_sql(query, parameters=[schema]).fetchall()}
+
+    # @feature data-store.import-atomic
+    def test_a_replace_that_fails_mid_insert_keeps_the_old_rows_and_no_other_table(self):
+        with self.patched_warehouse() as db:
+            self.write_to_table(db, "t", [{"id": 1, "value": "alpha", "modified": "2024-01-01 00:00:00"}])
+
+            # `id` is a BIGINT column, so the cast fails once the insert reaches "three"
+            frame = pd.DataFrame(
+                {"id": ["2", "three"], "value": ["beta", "gamma"], "modified": ["2024-01-02"] * 2}
+            )
+            frame["modified"] = pd.to_datetime(frame["modified"])
+            with WarehouseTableWriter("t", table_schema=self.make_schema(), database="main") as writer:
+                writer.insert(frame)
+                with self.assertRaises(ConversionException):
+                    writer.commit()
+
+            self.assertEqual(self.schema_tables(db), {"t"})
+            self.assertEqual(
+                self.read_rows(db, "t"), [{"id": 1, "value": "alpha", "modified": "2024-01-01 00:00:00"}]
+            )
+
+    # @feature data-store.run-without-import
+    def test_dropping_a_table_whose_schema_was_never_created_does_nothing(self):
+        # a fresh site's store has no schema until its first import
+        with self.patched_warehouse() as db:
+            WarehouseTable("Site DB", "tabToDo").drop()
+
+            db.raw_sql("CREATE SCHEMA site_db")
+            db.raw_sql("CREATE TABLE site_db.tabtodo AS SELECT 1 AS id")
+            WarehouseTable("Site DB", "tabToDo").drop()
+            self.assertNotIn("tabtodo", db.list_tables(database="site_db"))
 
     # @feature data-store.division-by-zero
     def test_a_division_by_zero_returns_null_as_on_the_live_connection(self):
@@ -218,6 +278,44 @@ class TestWarehouseWriteLock(InsightsIntegrationTestCase):
                 open_local_duckdb(path, read_only=False, allowed_dir=tmpdir, lock_timeout=1)
 
             self.assertIn("Could not set lock", str(caught.exception))
+
+
+class TestWarehouseMemoryLimit(InsightsIntegrationTestCase):
+    def memory_limits(self, path):
+        connections = [
+            lambda: open_local_duckdb(path, read_only=False),
+            lambda: open_local_duckdb(path, read_only=True),
+            connect_duckdb,
+        ]
+        limits = []
+        for connect in connections:
+            db = connect()
+            try:
+                limits.append(db.raw_sql("SELECT current_setting('memory_limit')").fetchone()[0])
+            finally:
+                db.disconnect()
+        return limits
+
+    # @feature data-store.memory-limit
+    def test_every_duckdb_connection_is_held_to_the_memory_limit(self):
+        with tempfile.TemporaryDirectory(prefix="insights_memory_test_") as tmpdir:
+            path = str(Path(tmpdir) / "warehouse.duckdb")
+
+            with patch.dict(frappe.conf, {"insights_duckdb_memory_limit": None}):
+                with duckdb.connect(config={"memory_limit": get_memory_limit()}) as plain:
+                    expected = plain.sql("SELECT current_setting('memory_limit')").fetchone()[0]
+                self.assertEqual(self.memory_limits(path), [expected] * 3)
+
+            with patch.dict(frappe.conf, {"insights_duckdb_memory_limit": "300MB"}):
+                self.assertEqual(self.memory_limits(path), ["286.1 MiB"] * 3)
+
+    # @feature data-store.memory-limit
+    def test_a_host_with_little_ram_keeps_duckdbs_lower_default(self):
+        for duckdb_default, expected in ((3 * 1024**3, 3 * 1024**3), (48 * 1024**3, 4 * 1000**3)):
+            with patch.object(
+                duckdb_connector, "get_duckdb_default_memory_limit", return_value=duckdb_default
+            ):
+                self.assertEqual(get_default_memory_limit(), expected)
 
 
 class TestMissingTableNotice(InsightsIntegrationTestCase):
@@ -272,6 +370,59 @@ class TestMissingTableNotice(InsightsIntegrationTestCase):
             self.make_table().announce_missing_table(import_running=True)
 
         toast.assert_not_called()
+
+
+class TestSyncSchedule(InsightsIntegrationTestCase):
+    TABLE = "sync_schedule_table"
+    # an @hourly table falls due on the hour, so a moving clock would decide the outcome
+    HALF_PAST = datetime(2026, 1, 1, 12, 30)
+
+    @classmethod
+    def before_class(cls):
+        frappe.get_doc(
+            {
+                "doctype": "Insights Table v3",
+                "table": cls.TABLE,
+                "label": cls.TABLE,
+                "data_source": "Site DB",
+                "stored": 1,
+                "sync_schedule": "@hourly",
+            }
+        ).insert(ignore_permissions=True)
+
+    @classmethod
+    def after_class(cls):
+        frappe.delete_doc("Insights Table v3", get_table_name("Site DB", cls.TABLE), force=True)
+
+    def after_test(self):
+        frappe.db.delete("Insights Table Import Log", {"table_name": self.TABLE})
+
+    def start_import(self, minutes_ago, status):
+        log = frappe.new_doc("Insights Table Import Log")
+        log.data_source = "Site DB"
+        log.table_name = self.TABLE
+        log.status = status
+        log.started_at = add_to_date(self.HALF_PAST, minutes=-minutes_ago)
+        log.insert(ignore_permissions=True)
+
+    def imported_tables(self):
+        with (
+            patch("frappe.enqueue") as enqueue,
+            patch("insights.api.data_store.now_datetime", return_value=self.HALF_PAST),
+        ):
+            sync_tables()
+        return [call.kwargs.get("table_name") for call in enqueue.call_args_list]
+
+    # @feature data-store.sync-schedule
+    def test_a_table_is_imported_once_its_schedule_is_due_since_its_last_import(self):
+        self.start_import(minutes_ago=120, status="Completed")
+        self.assertIn(self.TABLE, self.imported_tables())
+
+    # @feature data-store.sync-schedule
+    def test_a_failed_import_waits_for_the_next_due_time_instead_of_retrying_every_tick(self):
+        self.start_import(minutes_ago=120, status="Completed")
+        self.start_import(minutes_ago=10, status="Failed")
+        self.assertNotIn(self.TABLE, self.imported_tables())
 
 
 class TestImportRowLimit(InsightsIntegrationTestCase):
@@ -357,3 +508,286 @@ class TestImportRowLimit(InsightsIntegrationTestCase):
         capped = self.importer_for(self.CAPPED)
         self.assertEqual(capped.settings.row_limit, 2)
         self.assertEqual(self.rows_kept_by(capped), 2)
+
+
+HOLD_WRITE_LOCK = """
+import sys, time, duckdb
+con = duckdb.connect(sys.argv[1])
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+con.close()
+"""
+
+
+class TestIncrementalImport(InsightsIntegrationTestCase):
+    """An incremental import copies each source row once, from Sync From on."""
+
+    DATA_SOURCE = "Site DB"
+    TABLE = "incremental_import_table"
+
+    @classmethod
+    def before_class(cls):
+        doc = frappe.get_doc(
+            {
+                "doctype": "Insights Table v3",
+                "table": cls.TABLE,
+                "label": cls.TABLE,
+                "data_source": cls.DATA_SOURCE,
+                "sync_mode": "Incremental",
+                "sync_strategy": "Append Only",
+                "sync_cursor_column": "creation",
+                "sync_from": "2026-01-01 00:00:00",
+            }
+        )
+        doc.flags.ignore_links = True
+        doc.insert(ignore_permissions=True)
+        cls.table_doc = doc.name
+
+    @classmethod
+    def after_class(cls):
+        frappe.delete_doc("Insights Table v3", cls.table_doc, force=True, ignore_permissions=True)
+        frappe.db.delete("Insights Table Import Log", {"table_name": cls.TABLE})
+
+    def before_test(self):
+        tmpdir = tempfile.mkdtemp(prefix="insights_incremental_test_")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        self.path = str(Path(tmpdir) / "incremental.duckdb")
+        self.enterContext(patch.object(insights.warehouse, "get_db_path", return_value=self.path))
+        self.enterContext(patch.object(insights, "create_toast"))
+        self.enterContext(patch("frappe.utils.telemetry.capture"))
+        insights.db_connections.pop("insights", None)
+        frappe.db.set_value(
+            "Insights Table v3",
+            self.table_doc,
+            {
+                "stored": 0,
+                "row_limit": 0,
+                "sync_mode": "Incremental",
+                "sync_strategy": "Append Only",
+                "sync_cursor_column": "creation",
+                "sync_primary_key_column": None,
+                "sync_from": "2026-01-01 00:00:00",
+                "last_sync_bookmark": None,
+            },
+        )
+
+    def run_import(self, names, creations=None):
+        creations = creations or [f"2026-02-0{ord(name) - 96} 10:00:00.123456" for name in names]
+        self.import_source(pd.DataFrame({"name": names, "creation": pd.to_datetime(creations)}))
+
+    def import_source(self, rows):
+        with patch.object(WarehouseTable, "get_remote_table", return_value=ibis.memtable(rows)):
+            WarehouseTableImporter(WarehouseTable(self.DATA_SOURCE, self.TABLE)).start_import()
+
+    def stored_names(self):
+        return self.stored_rows()["name"].to_pylist()
+
+    def stored_rows(self):
+        db = open_local_duckdb(self.path)
+        try:
+            return db.table("incremental_import_table", database="site_db").to_pyarrow().sort_by("name")
+        finally:
+            db.disconnect()
+
+    @contextmanager
+    def another_writer_after_each_commit(self):
+        """Another import takes the file the moment this one releases it, as on a busy queue."""
+        holders = []
+        commit = WarehouseTableWriter.commit
+
+        def commit_then_hand_over(writer):
+            rows = commit(writer)
+            holder = subprocess.Popen(
+                [sys.executable, "-c", HOLD_WRITE_LOCK, self.path, "30"], stdout=subprocess.PIPE, text=True
+            )
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            holders.append(holder)
+            return rows
+
+        try:
+            with patch.object(WarehouseTableWriter, "commit", commit_then_hand_over):
+                yield
+        finally:
+            for holder in holders:
+                holder.kill()
+                holder.wait()
+
+    # @feature data-store.import-cursor
+    def test_a_row_is_copied_once_when_another_writer_holds_the_store_after_the_commit(self):
+        with self.another_writer_after_each_commit():
+            self.run_import(["a", "b"])
+        self.run_import(["a", "b", "c"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c"])
+
+    # @feature data-store.import-cursor
+    def test_a_capped_full_table_switched_to_incremental_imports_from_sync_from(self):
+        frappe.db.set_value("Insights Table v3", self.table_doc, {"sync_mode": "Full", "row_limit": 2})
+        self.run_import(["a", "b", "c", "d"])
+        self.assertEqual(self.stored_names(), ["c", "d"])
+
+        doc = frappe.get_doc("Insights Table v3", self.table_doc)
+        doc.update(
+            {
+                "sync_mode": "Incremental",
+                "sync_strategy": "Update or Insert",
+                "sync_primary_key_column": "name",
+            }
+        )
+        doc.save(ignore_permissions=True)
+        self.run_import(["a", "b", "c", "d"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c", "d"])
+
+    # @feature data-store.import-cursor
+    def test_sync_settings_cannot_change_while_the_table_is_imported(self):
+        frappe.db.set_value("Insights Table v3", self.table_doc, "sync_mode", "Full")
+        log = frappe.get_doc(
+            {
+                "doctype": "Insights Table Import Log",
+                "data_source": self.DATA_SOURCE,
+                "table_name": self.TABLE,
+                "status": "In Progress",
+            }
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.delete_doc, "Insights Table Import Log", log.name, force=True)
+
+        # the first import stores nothing until it commits
+        doc = frappe.get_doc("Insights Table v3", self.table_doc)
+        doc.sync_mode = "Incremental"
+        with self.assertRaises(frappe.ValidationError):
+            doc.save(ignore_permissions=True)
+
+        self.run_import(["a", "b"])
+        doc.reload()
+        doc.sync_mode = "Incremental"
+        with self.assertRaises(frappe.ValidationError):
+            doc.save(ignore_permissions=True)
+
+        self.assertEqual(self.stored_names(), ["a", "b"])
+
+    # @feature data-store.import-cursor
+    def test_a_first_incremental_import_waits_for_another_writer(self):
+        open_local_duckdb(self.path, read_only=False).disconnect()
+        holder = subprocess.Popen(
+            [sys.executable, "-c", HOLD_WRITE_LOCK, self.path, "2"], stdout=subprocess.PIPE, text=True
+        )
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+
+        self.run_import(["a", "b"])
+
+        self.assertEqual(self.stored_names(), ["a", "b"])
+
+    # @feature data-store.import-cursor
+    def test_a_sync_from_change_on_an_incremental_table_keeps_its_rows(self):
+        self.run_import(["a", "b"])
+
+        doc = frappe.get_doc("Insights Table v3", self.table_doc)
+        doc.sync_from = "2025-01-01 00:00:00"
+        doc.save(ignore_permissions=True)
+        # the source has purged a since
+        self.run_import(["b", "c"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c"])
+
+    # @feature data-store.import-cursor
+    def test_the_cursor_cannot_change_to_a_column_the_stored_rows_lack(self):
+        self.run_import(["a", "b"])
+
+        doc = frappe.get_doc("Insights Table v3", self.table_doc)
+        doc.sync_cursor_column = "modified"
+        with self.assertRaises(frappe.ValidationError):
+            doc.save(ignore_permissions=True)
+
+        self.assertEqual(self.stored_names(), ["a", "b"])
+
+    # @feature data-store.import-cursor
+    def test_rows_sharing_the_cursor_at_a_batch_boundary_are_copied_once(self):
+        with patch.object(WarehouseTableImporter, "calculate_batch_size", return_value=2):
+            self.run_import(
+                ["a", "b", "c", "d", "e"],
+                ["2026-02-01", "2026-02-02", "2026-02-02", "2026-02-02", "2026-02-03"],
+            )
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c", "d", "e"])
+
+    # @feature data-store.import-cursor
+    def test_a_row_committed_later_at_the_stored_cursor_is_copied_once(self):
+        self.run_import(["a", "b"], ["2026-02-01", "2026-02-02"])
+        self.run_import(["a", "b", "c"], ["2026-02-01", "2026-02-02", "2026-02-02"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c"])
+
+    # @feature data-store.import-cursor
+    def test_a_row_committed_later_at_the_stored_cursor_is_merged_once(self):
+        frappe.db.set_value(
+            "Insights Table v3",
+            self.table_doc,
+            {"sync_strategy": "Update or Insert", "sync_primary_key_column": "name"},
+        )
+        self.run_import(["a", "b"], ["2026-02-01", "2026-02-02"])
+        self.run_import(["a", "b", "c"], ["2026-02-01", "2026-02-02", "2026-02-02"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c"])
+
+    # @feature data-store.import-cursor
+    def test_a_merged_row_keeps_a_column_the_source_no_longer_reads(self):
+        frappe.db.set_value(
+            "Insights Table v3",
+            self.table_doc,
+            {"sync_strategy": "Update or Insert", "sync_primary_key_column": "name"},
+        )
+        creations = pd.to_datetime(["2026-02-01", "2026-02-02"])
+        self.import_source(pd.DataFrame({"name": ["a", "b"], "creation": creations, "remarks": ["x", "y"]}))
+        self.import_source(pd.DataFrame({"name": ["a", "b"], "creation": creations}))
+
+        self.assertEqual(self.stored_rows()["remarks"].to_pylist(), ["x", "y"])
+
+    # @feature data-store.import-cursor
+    def test_a_row_without_a_key_at_the_stored_cursor_is_merged_once(self):
+        frappe.db.set_value(
+            "Insights Table v3",
+            self.table_doc,
+            {"sync_strategy": "Update or Insert", "sync_primary_key_column": "name"},
+        )
+        for _run in range(3):
+            self.run_import(["a", None], ["2026-02-01", "2026-02-02"])
+
+        self.assertEqual(self.stored_names(), ["a", None])
+
+    # @feature data-store.import-cursor
+    def test_a_failed_commit_keeps_the_stored_rows(self):
+        self.run_import(["a", "b"], ["2026-02-01", "2026-02-02"])
+
+        with patch.object(DuckDBBackend, "insert", side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                self.run_import(["a", "b", "c"], ["2026-02-01", "2026-02-02", "2026-02-02"])
+
+        self.assertEqual(self.stored_names(), ["a", "b"])
+
+    # @feature data-store.import-cursor
+    def test_rows_without_a_cursor_value_are_copied_with_the_rest(self):
+        frappe.db.set_value("Insights Table v3", self.table_doc, "sync_mode", "Full")
+        with patch.object(WarehouseTableImporter, "calculate_batch_size", return_value=2):
+            self.run_import(["a", "b", "c", "d", "e"], [None, None, None, "2026-02-01", "2026-02-02"])
+
+        self.assertEqual(self.stored_names(), ["a", "b", "c", "d", "e"])
+
+    # @feature data-store.import-table
+    def test_a_column_empty_in_one_batch_keeps_its_source_type(self):
+        frappe.db.set_value("Insights Table v3", self.table_doc, "sync_mode", "Full")
+        rows = pa.table(
+            {
+                "name": ["a", "b", "c", "d"],
+                "creation": pa.array([datetime(2026, 2, i) for i in range(1, 5)], pa.timestamp("us")),
+                "remarks": pa.array([None, None, "late", "later"], pa.string()),
+                "amount": pa.array([None, Decimal("1.50"), None, Decimal("2.25")], pa.decimal128(18, 2)),
+            }
+        )
+        with patch.object(WarehouseTableImporter, "calculate_batch_size", return_value=2):
+            self.import_source(rows)
+
+        stored = self.stored_rows()
+        self.assertEqual(stored["remarks"].to_pylist(), [None, None, "late", "later"])
+        self.assertEqual(stored["amount"].type, pa.decimal128(18, 2))

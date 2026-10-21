@@ -1,4 +1,4 @@
-import { ScatterChart } from 'frappe-ui/charts'
+import { defineAsyncComponent } from 'vue'
 import type {
 	ReferenceLine as PlotReferenceLine,
 	ScatterChartProps,
@@ -8,6 +8,8 @@ import type { BubbleChartConfig } from '../../types/chart.types'
 import { numberFormatter, type NumberFormatter } from '../number_format'
 import type { ChartAdapterInput, ChartFiller } from './types'
 
+const ScatterChart = defineAsyncComponent(() => import('./lazy_charts').then((m) => m.ScatterChart))
+
 export function adaptBubbleChart(input: ChartAdapterInput): ChartFiller | undefined {
 	const config = input.config as BubbleChartConfig
 	const x = config.xAxis?.measure_name
@@ -16,10 +18,11 @@ export function adaptBubbleChart(input: ChartAdapterInput): ChartFiller | undefi
 
 	const props: ScatterChartProps = {
 		title: input.title,
+		subtitle: input.description,
 		data: input.result.rows,
 		x,
 		y,
-		// Three Measures, each printed in its own units: the two axes carry their
+		// Three Measures, each printed in its own units: the two axes keep their
 		// own formatter, and `format` is what is left — the size, which has no
 		// axis to hang one on.
 		xAxis: { format: numberFormatter(config, config.xAxis, input.result.rows) },
@@ -41,8 +44,8 @@ export function adaptBubbleChart(input: ChartAdapterInput): ChartFiller | undefi
 
 	// Coloring the points by a Dimension is grouping them by it, which is what a
 	// series is. The Insights name says what the groups were meant to read as.
-	const series = config.quadrant_column?.dimension_name
-	if (series) props.series = series
+	const splitBy = config.quadrant_column?.dimension_name
+	if (splitBy) props.splitBy = splitBy
 
 	const referenceLines = quadrantLines(config, props.xAxis!.format!, props.yAxis!.format!)
 	if (referenceLines.length) props.referenceLines = referenceLines
@@ -59,14 +62,14 @@ export function adaptBubbleChart(input: ChartAdapterInput): ChartFiller | undefi
 }
 
 /**
- * Both axes of a scatter are value axes, so a quadrant is drawn by a pair of
+ * Both axes of a scatter are value axes, so a quadrant is plotted by a pair of
  * reference lines and `axis: 'x'` takes a number rather than a category. The
  * numbers are the author's own: nothing computes a default divider, and a
- * quadrant chart with no line set draws none.
+ * quadrant chart with no line set plots none.
  *
  * Each rule prints where it sits, in the units of the axis it is read against.
  * The two are placed at opposite ends, because both default to the same corner and a quadrant chart
- * always draws them crossing.
+ * always plots them crossing.
  */
 function quadrantLines(
 	config: BubbleChartConfig,

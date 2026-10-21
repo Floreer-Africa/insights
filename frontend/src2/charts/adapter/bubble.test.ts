@@ -1,11 +1,11 @@
 import { ScatterChart } from 'frappe-ui/charts'
 import { describe, expect, it } from 'vitest'
-import { bubbleChart, type BubbleChartSpec } from './fixtures'
+import { bubbleChart, loadedComponent, type BubbleChartSpec } from './fixtures'
 import { adaptChart } from './index'
 
 function adapt(spec: BubbleChartSpec) {
 	const filler = adaptChart(bubbleChart(spec))
-	if (!filler) throw new Error('the adapter drew nothing for this Chart')
+	if (!filler) throw new Error('the adapter rendered nothing for this Chart')
 	return filler
 }
 
@@ -13,7 +13,7 @@ const propsOf = (spec: BubbleChartSpec) => adapt(spec).props
 
 describe('a bubble chart', () => {
 	// @feature charts.type-bubble charts.bubble-size-name-color
-	it('reads one Measure against another, sized and named by two more columns', () => {
+	it('reads one Measure against another, sized and named by two more columns', async () => {
 		const input = bubbleChart({
 			title: 'Revenue vs profit',
 			x: 'revenue',
@@ -24,7 +24,7 @@ describe('a bubble chart', () => {
 		})
 		const { component, props } = adaptChart(input)!
 
-		expect(component).toBe(ScatterChart)
+		expect(await loadedComponent(component)).toBe(ScatterChart)
 		expect(props.title).toBe('Revenue vs profit')
 		expect(props.x).toBe('revenue')
 		expect(props.y).toBe('profit')
@@ -32,7 +32,7 @@ describe('a bubble chart', () => {
 		expect(props.label).toBe('category')
 		// Coloring the points by a Dimension is grouping them by it, which is
 		// what a series is.
-		expect(props.series).toBe('department')
+		expect(props.splitBy).toBe('department')
 		expect(props.data).toBe(input.result.rows)
 	})
 
@@ -41,7 +41,7 @@ describe('a bubble chart', () => {
 		const props = propsOf({ x: 'revenue', y: 'profit' })
 		expect(props.size).toBeUndefined()
 		expect(props.label).toBeUndefined()
-		expect(props.series).toBeUndefined()
+		expect(props.splitBy).toBeUndefined()
 	})
 
 	// @feature charts.bubble-data-labels
@@ -60,7 +60,7 @@ describe('a bubble chart', () => {
 	})
 
 	// @feature charts.type-bubble
-	it('draws nothing until the Chart names both Measures', () => {
+	it('renders nothing until the Chart names both Measures', () => {
 		expect(adaptChart(bubbleChart({ x: '', y: 'profit' }))).toBeUndefined()
 		expect(adaptChart(bubbleChart({ x: 'revenue', y: '' }))).toBeUndefined()
 	})
@@ -96,7 +96,7 @@ describe('the quadrant dividers', () => {
 	})
 
 	// @feature charts.bubble-quadrants
-	it('draws only the rule the Chart set a value for', () => {
+	it('plots only the rule the Chart set a value for', () => {
 		expect(
 			propsOf({ x: 'revenue', y: 'profit', quadrants: { x: 100 } }).referenceLines,
 		).toEqual([
@@ -112,7 +112,7 @@ describe('the quadrant dividers', () => {
 	})
 
 	// @feature charts.bubble-quadrants
-	it('draws none when the Chart keeps the values but switched them off', () => {
+	it('plots none when the Chart keeps the values but switched them off', () => {
 		expect(
 			propsOf({ x: 'revenue', y: 'profit', quadrants: { x: 100, y: 50, shown: false } })
 				.referenceLines,

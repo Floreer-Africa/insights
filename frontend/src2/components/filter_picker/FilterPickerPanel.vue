@@ -2,17 +2,20 @@
 // The popover's inside: one input, and under it one list per stage. reka's
 // combobox owns the highlight and the arrow keys; this file owns what a pick
 // means.
-import { Badge, KeyboardShortcut, Tooltip } from 'frappe-ui'
+import { Badge, Button, KeyboardShortcut, Tooltip } from 'frappe-ui'
 import { Delete, Plus, Search } from 'lucide-vue-next'
+import { watchDebounced } from '@vueuse/core'
 import { ComboboxInput, ComboboxRoot } from 'reka-ui'
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { isMac } from '../../composables/useShortcut'
+import { showErrorToast } from '../../helpers'
 import { columnIcon } from '../../query/column_icon'
 import { __ } from '../../translation'
 import type { FilterOperator, FilterValue, QueryResultColumn } from '../../types/query.types'
 import {
 	calendarOf,
 	datePresets,
+	defaultOperator,
 	formatDate,
 	isMulti,
 	kindOf,
@@ -26,7 +29,7 @@ import {
 	pathOf,
 	relativeDirections,
 	relativeRow,
-	spanDates,
+	selectedRowKey,
 	spanOf,
 	splitPair,
 	summaryParts,
@@ -49,7 +52,7 @@ defineOptions({ inheritAttrs: false })
 const props = defineProps<{
 	columns: QueryResultColumn[]
 	valuesProvider: (column: QueryResultColumn) => (search: string) => Promise<string[]>
-	/** The smallest and largest a numeric column goes, for the presets it offers. */
+	/** The smallest and largest a numeric column goes, for the presets it lists. */
 	rangeProvider?: (column: QueryResultColumn) => Promise<[number, number] | undefined>
 	column?: QueryResultColumn
 	filters: Filter[]
@@ -68,7 +71,9 @@ const history = ref<Stage[]>([])
 const column = ref<QueryResultColumn | undefined>(props.column)
 const op = ref<OperatorDef | undefined>()
 const search = ref('')
-const editing = ref<Filter | undefined>()
+// shallow, so it is the host's own object: the host finds the rule to replace or
+// remove by identity, and a deep ref would hand back a proxy of it
+const editing = shallowRef<Filter | undefined>()
 
 const picked = ref<string[]>([])
 /** the values already ticked when the multi stage opened, in tick order */
@@ -100,16 +105,12 @@ const relativeForm = computed(() => ({
 	includeCurrent: relative.includeCurrent,
 }))
 
-/** reka holds the ticks while the text `=` / `≠` stage is up, nothing otherwise */
-const NONE: string[] = []
-const comboModel = computed(() => (multi.value ? picked.value : NONE))
+/** reka holds the ticks on the text `=` / `≠` stage, and the key of the edited rule's row on every other stage */
+const comboModel = computed(() =>
+	multi.value ? picked.value : editing.value && selectedRowKey(editing.value, stage.value),
+)
 function onComboModel(value: unknown) {
 	if (multi.value) picked.value = (value as string[]) || []
-}
-
-function firstStage(): Stage {
-	if (props.column) return 'operator'
-	return props.filters.length ? 'overview' : 'column'
 }
 
 function clearValue() {
@@ -133,7 +134,14 @@ function reset() {
 	editing.value = undefined
 	search.value = ''
 	clearValue()
-	stage.value = firstStage()
+	// Most dashboard filters keep the default operator, so its values come first.
+	if (props.column) {
+		op.value = defaultOperator(kindOf(props.column.type))
+		history.value = ['operator']
+		stage.value = 'value'
+		return
+	}
+	stage.value = props.filters.length ? 'overview' : 'column'
 }
 
 function load(filter: Filter) {
@@ -146,7 +154,7 @@ function load(filter: Filter) {
 	sticky.value = [...path.picked]
 	search.value = multi.value ? '' : path.text
 	// An operator that takes no value has no value stage to reopen on: opening one
-	// would offer a value the operator ignores, and store it when the reader picks.
+	// would list a value the operator ignores, and store it when the reader picks.
 	const needsValue = path.op.needsValue
 	history.value = props.column ? [] : ['overview', 'column']
 	if (needsValue) history.value.push('operator')
@@ -169,28 +177,41 @@ else reset()
 const distinct = ref<string[]>([])
 const fetching = ref(false)
 let request = 0
+let asked: string | undefined
 
-watch(
-	[() => column.value?.name, search, multi],
-	async ([, text, isMultiStage]) => {
-		if (!isMultiStage || !column.value) {
-			distinct.value = []
-			return
-		}
-		const id = ++request
-		fetching.value = true
-		const values = await props
-			.valuesProvider(column.value)(text as string)
-			.catch(() => [])
-		if (id !== request) return
-		// reka's ComboboxItem throws on an empty value
-		distinct.value = values.filter(Boolean)
-		fetching.value = false
-	},
-	{ immediate: true },
-)
+// Each ask is a `SELECT DISTINCT` on the source, so typing waits for a pause
+// while opening a column asks at once. Opening one also clears the search,
+// which the debounced watch then hears as the same ask a second time.
+async function fetchDistinct() {
+	if (!multi.value || !column.value) {
+		asked = undefined
+		distinct.value = []
+		return
+	}
+	const text = search.value
+	const key = JSON.stringify([column.value.name, text])
+	if (key === asked) return
+	asked = key
 
-// The column's own range, for the numbers the value stage offers. Fetched when
+	const id = ++request
+	fetching.value = true
+	const values = await props
+		.valuesProvider(column.value)(text)
+		.catch(() => {
+			// a failed ask is not an answer, so the same one may be asked again
+			if (id === request) asked = undefined
+			return []
+		})
+	if (id !== request) return
+	// reka's ComboboxItem throws on an empty value
+	distinct.value = values.filter(Boolean)
+	fetching.value = false
+}
+
+watch([() => column.value?.name, multi], fetchDistinct, { immediate: true })
+watchDebounced(search, fetchDistinct, { debounce: 300 })
+
+// The column's own range, for the numbers the value stage lists. Fetched when
 // the stage opens on a number column and not before: a range is one aggregate
 // over the whole result, and a text column has no use for one.
 const range = ref<[number, number] | undefined>()
@@ -204,14 +225,17 @@ watch(
 		if (!props.rangeProvider || !column.value) return
 
 		const id = ++rangeRequest
-		const fetched = await props.rangeProvider(column.value).catch(() => undefined)
+		const fetched = await props.rangeProvider(column.value).catch((error) => {
+			if (id === rangeRequest) showErrorToast(error, false)
+			return undefined
+		})
 		if (id === rangeRequest) range.value = fetched
 	},
 	{ immediate: true },
 )
 
 /** The rule the typed text spells, where the stage has a place for one. */
-const typed = computed<(Draft & { label: string; note?: string }) | undefined>(() => {
+const typed = computed<(Draft & { label: string }) | undefined>(() => {
 	const text = search.value.trim()
 	if (stage.value !== 'value' || !text || !op.value) return undefined
 
@@ -244,7 +268,6 @@ const typed = computed<(Draft & { label: string; note?: string }) | undefined>((
 			operator: 'within',
 			value: { span },
 			label: __('Use “{0}”', text),
-			note: spanDates(span),
 		}
 	}
 
@@ -329,7 +352,6 @@ const rows = computed<ListItem[]>(() => {
 			.map((row) => ({
 				key: `span:${row.span}`,
 				label: row.label,
-				note: spanDates(row.span),
 			}))
 		if (form.direction === 'current') return units
 		return [
@@ -353,16 +375,14 @@ const rows = computed<ListItem[]>(() => {
 		}))
 	}
 
-	const use: ListItem[] = typed.value
-		? [{ key: 'use', label: typed.value.label, note: typed.value.note }]
-		: []
+	const use: ListItem[] = typed.value ? [{ key: 'use', label: typed.value.label }] : []
 
 	if (kind.value === 'text') return use
 
 	if (kind.value === 'number') {
 		if (search.value.trim()) return use
 		// Cut from the column's own range, so a column with no range (not
-		// fetched yet, or every row the same number) offers nothing to pick and
+		// fetched yet, or every row the same number) lists nothing to pick and
 		// the reader types.
 		return between.value
 			? numberPairValues(range.value).map((pair) => ({
@@ -382,7 +402,6 @@ const rows = computed<ListItem[]>(() => {
 		.map((p) => ({
 			key: `span:${p.span}`,
 			label: p.label,
-			note: spanDates(p.span),
 		}))
 	const row = relativeRow()
 	const relativeRows: ListItem[] = matches(row.label) ? [{ key: row.key, label: row.label }] : []
@@ -402,7 +421,7 @@ const emptyText = computed(() => {
 })
 
 /**
- * The prompt carries what the path tokens used to. A value stage names the
+ * The prompt shows what the path tokens used to. A value stage names the
  * column and the operator it is filling in, because the operator is what says
  * how much to type; the operator stage names the column alone, the operator
  * being the thing the reader is there to pick.
@@ -459,7 +478,7 @@ function pick(item: ListItem) {
 	if (stage.value === 'unit') {
 		if (item.key === 'include') {
 			relative.includeCurrent = !relative.includeCurrent
-			// the row is redrawn with its new tick, so the highlight is put back
+			// the row is rendered again with its new tick, so the highlight is put back
 			highlight('include')
 			return
 		}
@@ -528,6 +547,8 @@ const cancelled = ref(false)
 // a pick left open commits when the popover closes: a tick on the multi stage,
 // or the days the calendar wrote into the input
 onBeforeUnmount(() => {
+	// a range still on its way belongs to a picker the reader has closed
+	rangeRequest++
 	if (cancelled.value) return
 	if (!draft.value) {
 		// A list the reader emptied is the filter taken off, not a pick half made.
@@ -565,7 +586,7 @@ function onKeydown(event: KeyboardEvent) {
 	}
 	if (event.key === 'Backspace' && !search.value) {
 		event.preventDefault()
-		// the row under the highlight already draws a Remove button, so the key
+		// the row under the highlight already shows a Remove button, so the key
 		// takes the row where there is one and the stage where there is not
 		const row = highlightedRow()
 		if (row?.removable && row.filter) emit('remove', row.filter)
@@ -593,17 +614,34 @@ function onKeydown(event: KeyboardEvent) {
  * take it. `Mod+Enter` stands apart because a multi stage's Enter ticks rather
  * than commits, and Backspace leaves the text alone while there is text.
  *
- * The opening stage says nothing. Enter on the row under the highlight is the
- * only key it takes, and a list a reader is already arrowing through does not
- * need a line under it to say so.
+ * A stage with nothing behind it says nothing. Enter on the row under the
+ * highlight is the only key it takes, and a list a reader is already arrowing
+ * through does not need a line under it to say so. A column mount opens on the
+ * values with the operators behind it, so it says Back from the start.
  */
 const keyHints = computed(() => {
 	if (!history.value.length) return []
-	const hints: { combo: string; label: string }[] = []
-	if (rows.value.length) hints.push({ combo: 'Enter', label: __('Select') })
-	else if (draft.value) hints.push({ combo: 'Enter', label: __('Apply') })
-	if (multi.value && draft.value) hints.push({ combo: 'Mod+Enter', label: __('Apply') })
-	if (!search.value) hints.push({ combo: 'Backspace', label: __('Back') })
+	const hints: { combo: string; label: string; run: () => void }[] = []
+	if (!search.value)
+		hints.push({
+			combo: 'Backspace',
+			label: __('Back'),
+			run: back,
+		})
+	if (rows.value.length)
+		hints.push({
+			combo: 'Enter',
+			label: __('Select'),
+			// the click reka answers Enter with, so a multi stage ticks the row
+			run: () => comboRef.value?.highlightedElement?.click(),
+		})
+	const apply = multi.value ? 'Mod+Enter' : rows.value.length ? undefined : 'Enter'
+	if (apply && draft.value)
+		hints.push({
+			combo: apply,
+			label: __('Apply'),
+			run: () => commit(),
+		})
 	return hints
 })
 
@@ -697,7 +735,18 @@ function focusInput() {
 				/>
 			</Tooltip>
 			<Tooltip v-else-if="history.length && !search" :text="__('Back')">
-				<Delete class="size-4 shrink-0 text-ink-gray-4" stroke-width="1.5" />
+				<Button
+					variant="ghost"
+					size="xs"
+					:label="__('Back')"
+					class="-me-1.5 shrink-0"
+					@mousedown.prevent
+					@click="back()"
+				>
+					<template #icon>
+						<Delete class="size-4 text-ink-gray-4" stroke-width="1.5" />
+					</template>
+				</Button>
 			</Tooltip>
 		</div>
 
@@ -730,18 +779,23 @@ function focusInput() {
 			<div v-if="keyHints.length" class="grid">
 				<div class="overflow-hidden">
 					<div
-						class="flex items-center justify-between border-t border-outline-gray-1 px-3 py-1.5"
+						class="flex items-center justify-between border-t border-outline-gray-1 p-1"
 					>
-						<span
+						<Button
 							v-for="hint in keyHints"
 							:key="hint.combo"
-							class="flex items-center gap-1.5"
+							variant="ghost"
+							size="xs"
+							@mousedown.prevent
+							@click="hint.run()"
 						>
-							<!-- the component sets its own `text-sm`, so the smaller size
-							     has to outrank it -->
-							<KeyboardShortcut :combo="hint.combo" class="!text-xs" />
-							<span class="text-xs text-ink-gray-5">{{ hint.label }}</span>
-						</span>
+							<span class="flex items-center gap-1.5">
+								<!-- the component sets its own `text-sm`, so the smaller size
+								     has to outrank it -->
+								<KeyboardShortcut :combo="hint.combo" class="!text-xs" />
+								{{ hint.label }}
+							</span>
+						</Button>
 					</div>
 				</div>
 			</div>

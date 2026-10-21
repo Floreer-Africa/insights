@@ -1,9 +1,10 @@
 import datetime
 import operator
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import ClassVar, NamedTuple
 
 import frappe
+import ibis
 from frappe.utils.data import (
     add_to_date,
     get_date_str,
@@ -19,6 +20,8 @@ from frappe.utils.data import (
 from sqlalchemy import Column, select, table
 from sqlalchemy import column as sa_column
 from sqlalchemy.sql import and_, case, distinct, func, or_, text
+
+from insights.exceptions import QueryRefused
 
 DATE_TYPES = ("Date", "Datetime")
 
@@ -158,8 +161,7 @@ class Functions:
         if function == "sum_if":
             return func.sum(case((args[0], args[1]), else_=0))
         if function == "between":
-            dates = add_start_and_end_time([args[1], args[2]])
-            return args[0].between(*dates)
+            return within_days(args[0], args[1], args[2])
         if function == "replace":
             return func.replace(args[0], args[1], args[2])
         if function == "substring":
@@ -228,8 +230,7 @@ class Functions:
 
 
 def handle_timespan(column, timespan):
-    dates = add_start_and_end_time(list(resolve_timespan(timespan)))
-    return column.between(*dates)
+    return within_days(column, *resolve_timespan(timespan))
 
 
 def resolve_timespan(timespan) -> tuple[datetime.date, datetime.date]:
@@ -241,11 +242,33 @@ def resolve_timespan(timespan) -> tuple[datetime.date, datetime.date]:
     return get_window(*read_timespan(timespan))
 
 
+def reading_day():
+    """The day a span resolves against: today, or the day `read_on` pinned."""
+    return getattr(frappe.local, "insights_reading_day", None) or nowdate()
+
+
+@contextmanager
+def read_on(day: str | None):
+    """Resolve every span in the block against `day`.
+
+    A drill cuts rows for the day its card was read. Its spans sit in the
+    chart's operations, in the dashboard's filters and in the source query, and
+    each resolves where it is built, so the day is the request's and not any one
+    operation's.
+    """
+    previous = getattr(frappe.local, "insights_reading_day", None)
+    frappe.local.insights_reading_day = day or previous
+    try:
+        yield
+    finally:
+        frappe.local.insights_reading_day = previous
+
+
 def read_timespan(timespan) -> tuple[str, datetime.date | None]:
     """The span a `within` filter names, and the date to resolve it against.
 
     A filter written before periods names the span alone, as a string or as the
-    words of one, and resolves against today. A period also pins the anchor, and
+    words of one, and resolves against `reading_day`. A period also pins the anchor, and
     a comparison span moves it, so both arrive beside the span.
     """
     if isinstance(timespan, list):
@@ -257,7 +280,7 @@ def read_timespan(timespan) -> tuple[str, datetime.date | None]:
     if not isinstance(timespan, dict) or not timespan.get("span"):
         raise Exception(f"Invalid timespan {timespan}")
 
-    anchor = getdate(timespan.get("anchor") or nowdate())
+    anchor = getdate(timespan.get("anchor") or reading_day())
     shift = timespan.get("shift") or {}
     if shift.get("unit"):
         anchor = shift_anchor(anchor, shift["unit"], shift.get("count") or 0)
@@ -329,9 +352,23 @@ def get_current_date_range(unit, anchor=None):
 
 def get_fiscal_year_start_date():
     fiscal_year_start = frappe.db.get_single_value("Insights Settings", "fiscal_year_start")
-    if not fiscal_year_start or get_date_str(fiscal_year_start) == "0001-01-01":
-        return getdate("1995-04-01")
-    return getdate(fiscal_year_start)
+    # frappe returns an unset date field as 0001-01-01, not None
+    if fiscal_year_start and get_date_str(fiscal_year_start) != "0001-01-01":
+        return getdate(fiscal_year_start)
+    return get_erpnext_fiscal_year_start() or getdate("1995-04-01")
+
+
+def get_erpnext_fiscal_year_start():
+    if not frappe.db.table_exists("Fiscal Year"):
+        return None
+
+    today = getdate()
+    return frappe.db.get_value(
+        "Fiscal Year",
+        {"disabled": 0, "year_start_date": ("<=", today), "year_end_date": (">=", today)},
+        "year_start_date",
+        order_by="year_start_date desc",
+    )
 
 
 def get_fy_start(date):
@@ -470,7 +507,7 @@ def get_date_range(timespan, include_current=False, anchor=None):
     """The days a span covers. `timespan` is "last 7 days", "next 3 months", …
 
     `include_current` is here for a caller that says it beside the span rather
-    than inside it. A span carrying "(include current)" says it for itself.
+    than inside it. A span with "(include current)" says it for itself.
     """
     parsed = parse_span(timespan)
     if not parsed:
@@ -511,9 +548,9 @@ def get_window(span: str, anchor: datetime.date | None = None) -> tuple[datetime
 
     Accepts every span `get_date_range` accepts, plus "<unit> to date", which
     ends at the anchor instead of at the end of the period. `anchor` defaults to
-    today.
+    `reading_day`.
     """
-    anchor = getdate(anchor or nowdate())
+    anchor = getdate(anchor or reading_day())
 
     parsed = parse_span(span)
     if not parsed:
@@ -555,16 +592,50 @@ def shift_anchor(anchor: datetime.date, unit: str, count: int) -> datetime.date:
     raise Exception(f"Invalid shift unit - {unit}")
 
 
-def add_start_and_end_time(dates):
-    if not dates:
-        return dates
+def midnight(day):
+    return datetime.datetime.combine(day, datetime.time())
 
-    dates[0] = getdate(dates[0])
-    dates[1] = getdate(dates[1])
-    dates[0] = dates[0].strftime("%Y-%m-%d 00:00:00")
-    dates[1] = dates[1].strftime("%Y-%m-%d 23:59:59")
 
-    return dates
+def is_calendar(column):
+    return column.type().is_date() or column.type().is_timestamp()
+
+
+def typed_instant(column, instant: datetime.datetime):
+    """`instant` as a literal of the column's own type, its zone included.
+
+    Each engine reads text its own way: SQLite compares a date as text, so
+    '2026-08-05' sorts before '2026-08-05 00:00:00', and SQL Server parses text
+    by the login's date format. BigQuery compares no TIMESTAMP with a DATETIME.
+    """
+    if column.type().is_date():
+        return instant.date()
+    return ibis.literal(instant, type=column.type())
+
+
+def day_bounds(column, first, last):
+    """The column, the start of day `first` and the start of the day after `last`.
+
+    A column that holds dates as text is compared as text, against bare dates:
+    ISO text sorts as the dates it spells, and a cast fails the whole query on
+    one value that is not a date.
+    """
+    if column.type().is_time():
+        frappe.throw(
+            frappe._("{0} is a Time column and names no day, so no span can filter it").format(
+                column.get_name()
+            ),
+            QueryRefused,
+        )
+    start = midnight(getdate(first))
+    end = midnight(getdate(last) + datetime.timedelta(days=1))
+    if not is_calendar(column):
+        return column, start.date().isoformat(), end.date().isoformat()
+    return column, typed_instant(column, start), typed_instant(column, end)
+
+
+def within_days(column, first, last):
+    column, start, end = day_bounds(column, first, last)
+    return (column >= start) & (column < end)
 
 
 class BinaryOperations:

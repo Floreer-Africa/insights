@@ -2,8 +2,8 @@
 // Every stage is this list. reka owns the highlight, the arrow keys and the
 // scrolling; this file only renders rows and reports a pick.
 import { Button, Checkbox, LoadingIndicator } from 'frappe-ui'
-import { X } from 'lucide-vue-next'
-import { ComboboxItem, ComboboxViewport, ListboxContent } from 'reka-ui'
+import { Check, X } from 'lucide-vue-next'
+import { ComboboxItem, ComboboxItemIndicator, ComboboxViewport, ListboxContent } from 'reka-ui'
 import { __ } from '../../translation'
 import type { ListItem } from './filter_picker'
 
@@ -34,7 +34,7 @@ function onSelect(item: ListItem, event: Event) {
 }
 
 /**
- * reka's ListboxItem carries our listeners twice: once through the `$attrs` it
+ * reka's ListboxItem passes our listeners twice: once through the `$attrs` it
  * spreads onto the row itself, once through Vue's own fallthrough. One click
  * would then pick the row twice and walk two stages on one Enter, so only the
  * first run of an event counts.
@@ -48,9 +48,9 @@ function onClick(item: ListItem, event: MouseEvent) {
 
 /**
  * reka's ListboxItem memoizes its row on the highlight and the tick alone
- * (ListboxItem.vue, the `v-memo` at line 79), so anything else the row draws
+ * (ListboxItem.vue, the `v-memo` at line 79), so anything else the row renders
  * has to arrive as a new key. The stage leads, so a stage change re-mounts
- * every row and no memoized row outlives the list it was drawn for. A
+ * every row and no memoized row outlives the list it was rendered for. A
  * reka-owned tick is left out — it moves reka's own model and invalidates the
  * memo by itself.
  */
@@ -94,10 +94,17 @@ function keyOf(item: ListItem, stage: string) {
 						class="size-4 shrink-0 text-ink-gray-5"
 						stroke-width="1.5"
 					/>
+					<!-- the note truncates before the label: the reader picks the label, and
+					     the note only says what it covers. A label beside a note never
+					     shrinks, because any shrink shows its ellipsis -->
 					<span
 						class="truncate text-start"
 						:class="
-							item.operator !== undefined ? 'font-medium text-ink-gray-8' : 'flex-1'
+							item.operator !== undefined
+								? 'font-medium text-ink-gray-8'
+								: item.note
+								  ? 'max-w-full shrink-0'
+								  : 'flex-1'
 						"
 						>{{ item.label }}</span
 					>
@@ -107,9 +114,19 @@ function keyOf(item: ListItem, stage: string) {
 							item.value
 						}}</span>
 					</template>
-					<span v-if="item.note" class="shrink-0 text-sm text-ink-gray-5">{{
-						item.note
-					}}</span>
+					<span
+						v-if="item.note"
+						class="ms-auto min-w-0 truncate text-sm text-ink-gray-5"
+						:title="item.note"
+						>{{ item.note }}</span
+					>
+					<!-- frappe-ui's Select and Combobox mark the chosen row this way -->
+					<ComboboxItemIndicator
+						v-if="!item.tick"
+						class="ms-1 inline-flex shrink-0 items-center justify-center"
+					>
+						<Check class="size-4 text-ink-gray-6" stroke-width="1.5" />
+					</ComboboxItemIndicator>
 					<Button
 						v-if="item.removable"
 						variant="ghost"

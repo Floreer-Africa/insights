@@ -7,6 +7,7 @@
 // rests on: if a case here cannot be said in the new shape, the split lost
 // something.
 
+import type { Component, ComponentOptions } from 'vue'
 import type { GranularityType } from '../../helpers/constants'
 import type { ConditionalColor, FormatGroupArgs } from '../../query/components/formatting_utils'
 import type {
@@ -25,6 +26,7 @@ import type {
 	QueryResult,
 	QueryResultColumn,
 } from '../../types/query.types'
+import { formatResultRows } from '../../query/helpers'
 import type { ChartAdapterInput } from './types'
 
 type DimensionSpec = string | { name: string; type?: ColumnDataType; granularity?: GranularityType }
@@ -34,9 +36,9 @@ type MeasureSpec =
 	| {
 			name: string
 			/**
-			 * Draws as this instead of the chart's own mark, i.e. a combo series.
+			 * Plots as this instead of the chart's own mark, i.e. a combo series.
 			 * The form wrote 'Line' and 'Bar' for three releases, so a saved chart
-			 * carries either case.
+			 * has either case.
 			 */
 			mark?: 'line' | 'bar' | 'Line' | 'Bar'
 			/** Measured against the second value axis. */
@@ -48,6 +50,7 @@ type MeasureSpec =
 			area?: boolean
 			smooth?: boolean
 			dataPoints?: boolean
+			trendLine?: boolean
 	  }
 
 export type AxisChartSpec = {
@@ -73,7 +76,7 @@ export type AxisChartSpec = {
 	readings?: Record<string, (number | string | null)[]>
 	/**
 	 * Measures that reach the tooltip and nothing else. The same summarize
-	 * returns them, so the result carries a value column for each of them.
+	 * returns them, so the result includes a value column for each of them.
 	 */
 	tooltipMeasures?: MeasureSpec[]
 	stacked?: boolean
@@ -94,18 +97,18 @@ export function axisChart(spec: AxisChartSpec): ChartAdapterInput {
 	const split = spec.splitBy ? toDimension(spec.splitBy.dimension) : undefined
 	const measures = spec.measures.map(toMeasureSpec)
 	const tooltipMeasures = (spec.tooltipMeasures ?? []).map(toMeasureSpec)
-	const drawnColumns = valueColumns(measures, spec.splitBy?.into)
+	const plottedColumns = valueColumns(measures, spec.splitBy?.into)
 	// What the server sends back for the tooltip Measures. A split leaves them
-	// out of the pivot, and a name already drawn is one column, not two — the
+	// out of the pivot, and a name already plotted is one column, not two — the
 	// summarize drops it rather than aliasing the same name twice.
-	const drawnNames = new Set(measures.map((measure) => measure.name))
+	const plottedNames = new Set(measures.map((measure) => measure.name))
 	const columns = [
-		...drawnColumns,
+		...plottedColumns,
 		...(spec.splitBy
 			? []
 			: tooltipMeasures
 					.map((measure) => measure.name)
-					.filter((name) => !drawnNames.has(name))),
+					.filter((name) => !plottedNames.has(name))),
 	]
 	const categories = spec.categories ?? defaultCategories(dimension)
 
@@ -211,6 +214,7 @@ function toSeries(measure: MeasureSpecObject): Series {
 		...(measure.area ? { show_area: true } : {}),
 		...(measure.smooth ? { smooth: true } : {}),
 		...(measure.dataPoints ? { show_data_points: true } : {}),
+		...(measure.trendLine ? { show_trend_line: true } : {}),
 	}
 }
 
@@ -232,10 +236,10 @@ function defaultCategories(dimension: Dimension) {
 	return ['North', 'South']
 }
 
-// The types that draw one picture out of one shape. Each spec says what the
+// The types that render one chart out of one shape. Each spec says what the
 // Chart measures and what came back for it. The server has already grouped and
 // ordered every one of these results, so a fixture writes the rows as the
-// picture reads them.
+// chart reads them.
 
 export type DonutChartSpec = {
 	title?: string
@@ -293,7 +297,7 @@ export type FunnelChartSpec = {
 	stages?: FunnelStageSpec[]
 	/**
 	 * Measures mode: one Measure per stage, aggregated with no group-by, so they
-	 * all arrive on one row. The config admits both shapes at once, and the
+	 * all arrive on one row. The config allows both shapes at once, and the
 	 * server derives the Chart from this one whenever it is set.
 	 */
 	measures?: FunnelStageSpec[]
@@ -356,7 +360,7 @@ export type BubbleChartSpec = {
 	dataLabels?: boolean
 	/**
 	 * The dividers that cut the plot into quadrants. `shown: false` keeps the
-	 * values on the Chart without drawing them.
+	 * values on the Chart without plotting them.
 	 */
 	quadrants?: { x?: number; y?: number; shown?: boolean }
 }
@@ -536,19 +540,24 @@ type NumberValueSpec = {
 	comparison?: NumberComparison
 	/** The target column's data, one number per period. */
 	target?: (number | null)[]
+	/** Definitions and caveats, behind the card's mark. */
+	info?: string
+	/** A bar under the card for how far the reading has come. */
+	progress?: boolean
+	progressColor?: string
 }
 
 export type NumberChartSpec = {
 	title?: string
 	values: NumberValueSpec[]
-	/** The one reading a dashboard cell names, by id. Absent draws every value. */
+	/** The one reading a dashboard cell names, by id. Absent shows every value. */
 	reading?: string
 	/** The Dimension the readings are grouped by. A comparison and a sparkline both need one. */
 	period?: DimensionSpec
 	sparkline?: boolean
 	sparklineColor?: string
 	/**
-	 * The second run a span card's sparkline is drawn from: one reading per
+	 * The second run a span card's sparkline is plotted from: one reading per
 	 * period inside the span, keyed by value name.
 	 */
 	sparklineSeries?: Record<string, (number | null)[]>
@@ -589,6 +598,9 @@ export function numberChart(spec: NumberChartSpec): ChartAdapterInput {
 				? { target: { measure: toMeasure(`${value.name}_target`) } }
 				: {}),
 			...(value.comparison ? { comparison: value.comparison } : {}),
+			...(value.info ? { info: value.info } : {}),
+			...(value.progress ? { progress: true } : {}),
+			...(value.progressColor ? { progress_color: value.progressColor } : {}),
 		})),
 		sparkline: Boolean(spec.sparkline),
 		...(spec.sparklineColor ? { sparkline_color: spec.sparklineColor } : {}),
@@ -848,3 +860,181 @@ const columnOfMeasure = (measure: Measure): QueryResultColumn => ({
 	name: measure.measure_name,
 	type: measure.data_type,
 })
+
+/**
+ * The component a filler renders. A chart type other than Bar and Line is split
+ * out of the entry, so its filler holds an async wrapper until it loads.
+ */
+export async function loadedComponent(component: Component) {
+	const load = (component as ComponentOptions).__asyncLoader
+	return load ? await load() : component
+}
+
+// One result every chart type is adapted over: the values that have reached a
+// screen wrong before. A null in a Dimension and in a Measure, a number the
+// driver sent as text, a decimal, the largest safe integer, an empty string, and
+// dates at midnight and on month, week and year boundaries. No cell holds a zero
+// or the text "null", so either one on the way out was made up on the way.
+
+const ADVERSARIAL_COLUMNS: QueryResultColumn[] = [
+	{ name: 'region', type: 'String' },
+	{ name: 'channel', type: 'String' },
+	{ name: 'order_month', type: 'Date' },
+	{ name: 'order_week', type: 'Date' },
+	{ name: 'created_at', type: 'Datetime' },
+	{ name: 'status', type: 'Text' },
+	{ name: 'revenue', type: 'Decimal' },
+	{ name: 'units', type: 'Integer' },
+]
+
+const ADVERSARIAL_GRAINS: Record<string, GranularityType> = {
+	order_month: 'month',
+	order_week: 'week',
+	created_at: 'day',
+}
+
+const ADVERSARIAL_ROWS: Record<string, any>[] = [
+	{
+		region: 'India',
+		channel: 'Web',
+		order_month: '2025-12-01',
+		order_week: '2025-12-29',
+		created_at: '2025-12-31 00:00:00',
+		status: 'Paid',
+		revenue: 1200.55,
+		units: 3,
+	},
+	{
+		region: null,
+		channel: 'Store',
+		order_month: '2026-01-01',
+		order_week: '2026-01-05',
+		created_at: '2026-01-01 00:00:00',
+		status: null,
+		revenue: '1500.25',
+		units: Number.MAX_SAFE_INTEGER,
+	},
+	{
+		region: 'Japan',
+		channel: null,
+		order_month: '2026-02-01',
+		order_week: '2026-02-02',
+		created_at: '2026-02-28 00:00:00',
+		status: '',
+		revenue: null,
+		units: 7,
+	},
+	{
+		region: 'Brazil',
+		channel: 'Partner',
+		order_month: null,
+		order_week: null,
+		created_at: null,
+		status: 'Refunded',
+		revenue: -0.1,
+		units: null,
+	},
+	{
+		region: '',
+		channel: '',
+		order_month: '2026-03-01',
+		order_week: '2026-03-30',
+		created_at: '2026-03-01 00:00:00',
+		status: 'Paid',
+		revenue: 0.000125,
+		units: 12,
+	},
+]
+
+export function adversarialResult(): QueryResult {
+	const result = resultWith(
+		ADVERSARIAL_COLUMNS,
+		ADVERSARIAL_ROWS.map((row) => ({ ...row })),
+	)
+	result.formattedRows = formatResultRows(result, ADVERSARIAL_GRAINS)
+	return result
+}
+
+function adversarialDimension(name: string): Dimension {
+	const column = ADVERSARIAL_COLUMNS.find((c) => c.name === name)!
+	return {
+		...toDimension({ name, type: column.type }),
+		...(ADVERSARIAL_GRAINS[name] ? { granularity: ADVERSARIAL_GRAINS[name] } : {}),
+	}
+}
+
+const ADVERSARIAL_CONFIGS: Record<string, () => object> = {
+	Bar: axisConfig,
+	Line: axisConfig,
+	Row: axisConfig,
+	Number: () => ({
+		number_columns: ['revenue', 'units'].map((name) => ({ ...toMeasure(name), id: name })),
+		number_column_options: [{}, {}],
+		sparkline: true,
+		date_column: adversarialDimension('order_month'),
+	}),
+	Donut: () => ({
+		label_column: adversarialDimension('region'),
+		value_column: toMeasure('revenue'),
+	}),
+	Funnel: () => ({
+		label_column: adversarialDimension('channel'),
+		value_column: toMeasure('revenue'),
+	}),
+	Table: () => ({
+		rows: ['region', 'channel', 'order_month', 'order_week', 'created_at', 'status'].map(
+			adversarialDimension,
+		),
+		columns: [],
+		values: [toMeasure('revenue'), toMeasure('units')],
+		order_by: [],
+	}),
+	Map: () => ({
+		location_column: adversarialDimension('region'),
+		value_column: toMeasure('revenue'),
+		map_type: 'world',
+	}),
+	Bubble: () => ({
+		xAxis: toMeasure('revenue'),
+		yAxis: toMeasure('units'),
+		dimension: adversarialDimension('region'),
+		quadrant_column: adversarialDimension('channel'),
+	}),
+	Sankey: () => ({
+		source_column: adversarialDimension('region'),
+		target_column: adversarialDimension('channel'),
+		value_column: toMeasure('revenue'),
+	}),
+	Heatmap: () => ({
+		x_column: adversarialDimension('order_month'),
+		y_column: adversarialDimension('region'),
+		value_column: toMeasure('revenue'),
+	}),
+}
+
+function axisConfig() {
+	return {
+		x_axis: { dimension: adversarialDimension('order_month') },
+		y_axis: {
+			series: [toMeasure('revenue'), toMeasure('units')].map((measure) => ({ measure })),
+		},
+	}
+}
+
+/**
+ * The types that hand the renderer something other than the result's rows: a Map
+ * folds them into regions, a Number Chart reads the newest one. Every other type
+ * must pass the rows on whole.
+ */
+export const RESHAPES_ROWS = ['Map', 'Number']
+
+/** A Chart of `chart_type` over the adversarial result, reading every column it can. */
+export function adversarialChart(chart_type: string): ChartAdapterInput {
+	const config = ADVERSARIAL_CONFIGS[chart_type]
+	if (!config) throw new Error(`fixtures.ts states no adversarial config for ${chart_type}`)
+	return {
+		chart_type,
+		config: config() as unknown as ChartConfig,
+		result: adversarialResult(),
+	}
+}

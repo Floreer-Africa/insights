@@ -1,6 +1,6 @@
 import { call, toast } from 'frappe-ui'
 import { __ } from '../translation'
-import { useTelemetry } from '@framework/ui/telemetry/index.ts'
+import { useTelemetry } from '../telemetry'
 import { computed, reactive, toRefs } from 'vue'
 import useChart, { newChart } from '../charts/chart'
 import useDashboard, { newDashboard } from '../dashboard/dashboard'
@@ -84,21 +84,10 @@ function makeWorkbook(name: string) {
 	}
 
 	function removeQuery(name: string) {
-		function _remove() {
-			const idx = workbook.doc.queries.findIndex((row) => row.name === name)
-			if (idx === -1) return
-
-			const query = useQuery(name)
-			waitUntil(() => query.isloaded).then(() => query.delete())
-
-			workbook.doc.queries.splice(idx, 1)
-			openNext('query', idx)
-		}
-
 		confirmDialog({
 			title: __('Delete Query'),
 			message: __('Are you sure you want to delete this query?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('query', useQuery(name)),
 		})
 	}
 
@@ -125,21 +114,10 @@ function makeWorkbook(name: string) {
 	}
 
 	function removeChart(chartName: string) {
-		function _remove() {
-			const idx = workbook.doc.charts.findIndex((row) => row.name === chartName)
-			if (idx === -1) return
-
-			const chart = useChart(chartName)
-			waitUntil(() => chart.isloaded).then(() => chart.delete())
-
-			workbook.doc.charts.splice(idx, 1)
-			openNext('chart', idx)
-		}
-
 		confirmDialog({
 			title: __('Delete Chart'),
 			message: __('Are you sure you want to delete this chart?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('chart', useChart(chartName)),
 		})
 	}
 
@@ -158,22 +136,32 @@ function makeWorkbook(name: string) {
 	}
 
 	function removeDashboard(dashboardName: string) {
-		function _remove() {
-			const idx = workbook.doc.dashboards.findIndex((row) => row.name === dashboardName)
-			if (idx === -1) return
-
-			const dashboard = useDashboard(dashboardName)
-			waitUntil(() => dashboard.isloaded).then(() => dashboard.delete())
-
-			workbook.doc.dashboards.splice(idx, 1)
-			openNext('dashboard', idx)
-		}
-
 		confirmDialog({
 			title: __('Delete Dashboard'),
 			message: __('Are you sure you want to delete this dashboard?'),
-			onSuccess: _remove,
+			onSuccess: () => removeItem('dashboard', useDashboard(dashboardName)),
 		})
+	}
+
+	// Remove the row only after the server deletes the document. The server can
+	// refuse, for example when a desk document shows it. The author then stays
+	// where they were.
+	async function removeItem(
+		type: 'query' | 'chart' | 'dashboard',
+		item: { name: string; isloaded: boolean; delete: () => Promise<void> },
+	) {
+		await waitUntil(() => item.isloaded)
+		await item.delete()
+
+		const rows = {
+			query: workbook.doc.queries,
+			chart: workbook.doc.charts,
+			dashboard: workbook.doc.dashboards,
+		}[type]
+		const idx = rows.findIndex((row) => row.name === item.name)
+		if (idx === -1) return
+		rows.splice(idx, 1)
+		openNext(type, idx)
 	}
 
 	// Called after the row at `idx` is spliced out, so `idx` now holds the row
@@ -301,11 +289,7 @@ function makeWorkbook(name: string) {
 			title: __('Delete Workbook'),
 			message: __('Are you sure you want to delete this workbook?'),
 			theme: 'red',
-			onSuccess: () => {
-				workbook.delete().then(() => {
-					router.replace('/workbook')
-				})
-			},
+			onSuccess: () => workbook.delete().then(() => router.replace('/workbook')),
 		})
 	}
 
@@ -411,6 +395,17 @@ function makeWorkbook(name: string) {
 
 export type Workbook = ReturnType<typeof makeWorkbook>
 
+// Where this open came from. The page has two signals: the history entry it was
+// pushed from, and the referrer when there is none. Every other arrival is a
+// link.
+function openedVia() {
+	const back = router.options.history.state.back
+	if (back === '/workbook') return 'list'
+	if (back === '/') return 'recent'
+	if (!back && document.referrer.startsWith(`${location.origin}/app`)) return 'desk'
+	return 'link'
+}
+
 export function getWorkbookResource(name: string) {
 	const doctype = 'Insights Workbook'
 	const workbook = useDocumentResource<InsightsWorkbook>(doctype, name, {
@@ -436,7 +431,10 @@ export function getWorkbookResource(name: string) {
 		},
 	})
 
-	workbook.onAfterLoad(() => workbook.call('track_view').catch(() => {}))
+	workbook.onAfterLoad(() =>
+		// eslint-disable-next-line no-restricted-syntax -- a view count is telemetry, and the reader has nothing to act on if it fails
+		workbook.call('track_view', { via: openedVia() }).catch(() => {}),
+	)
 	wheneverChanges(
 		() => workbook.doc.read_only,
 		() => {

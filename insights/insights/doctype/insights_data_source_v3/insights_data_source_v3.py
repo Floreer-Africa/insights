@@ -8,15 +8,6 @@ from contextlib import contextmanager
 
 import frappe
 from frappe.model.document import Document
-try:
-	from frappe.utils.telemetry import capture
-except ImportError:
-	# PR-Foundry fork patch (framework#67 follow-on): frappe v16 dropped its posthog
-	# integration (refactor!: "Drop posthog" #39990), removing frappe.utils.telemetry.
-	# Optional telemetry import — degrade to a no-op so importing this DocType
-	# controller (and `bench migrate`) does not fail. Re-verify after upstream-sync.
-	def capture(*args, **kwargs):
-		return
 from ibis import BaseBackend
 
 import insights
@@ -27,6 +18,7 @@ from insights.insights.doctype.insights_table_v3.insights_table_v3 import (
     InsightsTablev3,
 )
 from insights.insights.doctype.insights_table_v3.table_rename import rename_tables
+from insights.telemetry import capture, error_kind
 
 from .connectors.bigquery import get_bigquery_connection
 from .connectors.clickhouse import get_clickhouse_connection
@@ -46,6 +38,11 @@ from .connectors.sqlite import get_sqlite_connection
 
 class DataSourceConnectionError(frappe.ValidationError):
     pass
+
+
+def source_type(database_type: str | None, is_site_db: bool = False) -> str:
+    """The value `docs/telemetry.md` puts on a source's `type`."""
+    return "site_db" if is_site_db else (database_type or "unknown").lower()
 
 
 class InsightsDataSourceDocument:
@@ -91,9 +88,12 @@ class InsightsDataSourceDocument:
 
     def after_insert(self):
         if not self.is_site_db:
-            capture("data_source_created", "insights")
+            capture("data_source_created", type=self.source_type, ssl=bool(self.use_ssl))
 
     def on_update(self):
+        # db_set loads the saved row as the doc before save, which hides a change
+        credentials_changed = self.has_credentials_changed()
+
         if self.type == "REST API":
             self.db_set(
                 {
@@ -114,14 +114,18 @@ class InsightsDataSourceDocument:
 
             return
 
-        credentials_changed = self.has_credentials_changed()
-        if not self.is_site_db and credentials_changed and self.database_type in ["MariaDB", "PostgreSQL"]:
-            self.db_set("is_frappe_db", is_frappe_db(self))
-
         self.status = "Active" if self.test_connection() else "Inactive"
         self.db_set("status", self.status)
 
-        if self.status == "Active" and credentials_changed:
+        if (
+            self.status == "Active"
+            and credentials_changed
+            and self.database_type in ["MariaDB", "PostgreSQL"]
+        ):
+            self.db_set("is_frappe_db", is_frappe_db(self))
+
+        # a REST API source's tables come from its imports, which Update Tables lists
+        if self.status == "Active" and credentials_changed and self.type != "REST API":
             self.update_table_list()
 
     def has_credentials_changed(self):
@@ -299,7 +303,7 @@ class InsightsDataSourcev3(InsightsDataSourceDocument, Document):
             try:
                 db.raw_sql(f"SET MAX_STATEMENT_TIME={get_max_execution_time()}")
             except Exception:
-                pass
+                pass  # nosemgrep - MySQL has no such variable, so its queries run without a time limit
 
         insights.db_connections[self.name] = db
         return db
@@ -365,7 +369,7 @@ class InsightsDataSourcev3(InsightsDataSourceDocument, Document):
         return schemas or ["public"]
 
     def qualify_table_names(self) -> bool:
-        """Whether table names should carry a `<schema>.` prefix.
+        """Whether table names should have a `<schema>.` prefix.
 
         Only useful when the data source spans more than one schema — with a single schema
         there is nothing to disambiguate and the prefix just leaks into the UI and breaks the
@@ -387,13 +391,39 @@ class InsightsDataSourcev3(InsightsDataSourceDocument, Document):
         """Resolve `(schema, table)` for a postgres table name — inverse of `format_table_name`.
 
         Names are only qualified when the data source spans multiple schemas, but names
-        stored before that was the case may still carry the prefix — so accept both.
+        stored before that was the case may still have the prefix — so accept both.
         """
         schemas = self.get_postgres_schemas()
-        schema, separator, table = table_name.partition(".")
-        if separator and schema in schemas:
-            return schema, table
+        # a schema name may itself have a dot
+        for schema in sorted(schemas, key=len, reverse=True):
+            if table_name.startswith(f"{schema}."):
+                return schema, table_name[len(schema) + 1 :]
         return schemas[0], table_name
+
+    def sql_table_name(self, table: str, schema: str | None = None) -> str | None:
+        """The table a SQL query reads as `schema.table` or `table`, named as `get_table_list`
+        lists it.
+
+        PostgreSQL reads an unqualified name from the first schema in the search path that
+        has it, and the connection sets the search path to `schema`.
+
+        None when this data source does not read `schema`: binding the bare name would
+        read a same-named table in another schema.
+        """
+        if self.database_type != "PostgreSQL":
+            return None if schema else table
+
+        schemas = self.get_postgres_schemas()
+        if schema:
+            if schema not in schemas:
+                return None
+            schemas = [schema]
+
+        names = [self.format_table_name(table, s) for s in schemas]
+        listed = frappe.get_all(
+            "Insights Table v3", filters={"data_source": self.name, "table": ("in", names)}, pluck="table"
+        )
+        return next((name for name in names if name in listed), names[0])
 
     def table_identity(self, table_name: str) -> str:
         """Name the remote table `table_name` points at, free of the spelling of the day.
@@ -433,26 +463,34 @@ class InsightsDataSourcev3(InsightsDataSourceDocument, Document):
 
         return db.list_tables(database=database_name)
 
+    @property
+    def source_type(self):
+        return source_type(self.database_type, self.is_site_db)
+
     @frappe.whitelist()
     def test_connection(self, raise_exception: bool | None = False):
+        """Reach the source once and report whether it answered.
+
+        Every test arrives here, the button and the save alike, so the outcome
+        is counted once. What the driver said stays here. Only the kind of
+        failure travels. The message and the host it names do not.
+        """
+        try:
+            self.attempt_connection()
+        except Exception as e:
+            capture("data_source_tested", type=self.source_type, ok=False, error_kind=error_kind(e))
+            if raise_exception:
+                raise e
+            return
+
+        capture("data_source_tested", type=self.source_type, ok=True)
+        return True
+
+    def attempt_connection(self):
         if self.type == "REST API":
-            return self.test_api_connection(raise_exception)
-
-        try:
+            self.get_api_client().test_connection()
+        else:
             self.get_table_list()
-            return True
-        except Exception as e:
-            if raise_exception:
-                raise e
-
-    def test_api_connection(self, raise_exception: bool | None = False):
-        client = self.get_api_client()
-        try:
-            client.test_connection()
-            return True
-        except Exception as e:
-            if raise_exception:
-                raise e
 
     def get_api_client(self):
         if self.type != "REST API":

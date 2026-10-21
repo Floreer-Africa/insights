@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { TextInput } from 'frappe-ui'
+import { TextInput, Tooltip } from 'frappe-ui'
 import { __ } from '../../translation'
 import { Check, ChevronLeft, Edit, Plus, Settings, XIcon } from 'lucide-vue-next'
 import { computed, h, ref } from 'vue'
@@ -24,11 +24,16 @@ const props = defineProps<{
 	enableFormat?: boolean
 	/** Width of the settings popover, for a `config-fields` slot that needs more. */
 	configWidth?: string
+	/**
+	 * Heads the measure's own settings "Value", for a `config-fields` slot that
+	 * adds headed sections of its own.
+	 */
+	valueHeading?: boolean
 }>()
 
 /**
  * The settings popover holds a labeled row, so it is as wide as the widest
- * control that row carries: the number format group, at 10rem, beside a label
+ * control that row holds: the number format group, at 10rem, beside a label
  * column of 30%. Narrower than this and the group runs past the edge.
  */
 const CONFIG_WIDTH = '17rem'
@@ -106,8 +111,8 @@ function getAutoMeasureName(columnMeasure: ColumnMeasure) {
 }
 
 /**
- * The aggregation the picker is drawing, which is not always one the measure
- * carries.
+ * The aggregation the picker is showing, which is not always one the measure
+ * has.
  *
  * A source whose columns are already measures opens on the column list under
  * `sum`, skipping the "pick a function" step that would otherwise name a column
@@ -117,8 +122,8 @@ function getAutoMeasureName(columnMeasure: ColumnMeasure) {
  * autosave and two re-runs of the chart data.
  */
 const shownAggregation = computed<AggregationType | ''>(() => {
-	const carried = columnMeasure.value?.aggregation
-	if (carried) return carried as AggregationType
+	const measureAggregation = columnMeasure.value?.aggregation
+	if (measureAggregation) return measureAggregation as AggregationType
 	return sourceHasMeasures.value && !userResetAggregation.value ? 'sum' : ''
 })
 
@@ -224,7 +229,7 @@ const filteredColumnOptions = computed(() => {
 	return columnOptions.value.filter((option) => option.label.toLowerCase().includes(query))
 })
 
-// a currency code is text, so only text columns are offered
+// a currency code is text, so only text columns are listed
 const currencyColumnOptions = computed(() => [
 	{ label: __('Site currency'), value: '' },
 	...props.columnOptions
@@ -254,7 +259,13 @@ function resetAggregation() {
 	resetMeasure()
 }
 
-const label = ref(measure.value.measure_name)
+// An empty name would unmount these settings, whose trigger shows only for a
+// named measure.
+function rename(event: Event) {
+	const input = event.target as HTMLInputElement
+	if (input.value.trim()) measure.value.measure_name = input.value
+	else input.value = measure.value.measure_name
+}
 
 function handleRemove() {
 	measure.value = {
@@ -289,7 +300,7 @@ function handleRemove() {
 					</div>
 				</template>
 
-				<template #default="{ toggle: togglePopover }">
+				<template #default="{ close }">
 					<div
 						class="relative mt-1 overflow-hidden rounded-6 bg-surface-base p-1.5 text-base shadow-2xl"
 					>
@@ -346,7 +357,7 @@ function handleRemove() {
 										@click.prevent.stop="
 											() => {
 												pickColumn(option)
-												togglePopover()
+												close()
 											}
 										"
 									>
@@ -374,7 +385,7 @@ function handleRemove() {
 										? __('Edit Expression')
 										: __('Custom Expression')
 								"
-								@click="openMeasureDialog(togglePopover)"
+								@click="openMeasureDialog(close)"
 							>
 								<template #prefix>
 									<component
@@ -399,18 +410,30 @@ function handleRemove() {
 			</template>
 			<template #default="{ close: closeSettings }">
 				<div
-					class="flex flex-col gap-2 p-2"
+					class="flex max-h-[var(--reka-popover-content-available-height)] flex-col gap-2 overflow-y-auto p-2"
 					:style="{ width: props.configWidth || CONFIG_WIDTH }"
 				>
-					<InlineFormControlLabel :label="__('Label')">
+					<div class="flex items-center gap-1">
 						<TextInput
+							class="flex-1"
 							autocomplete="off"
+							:aria-label="__('Label')"
 							:modelValue="measure.measure_name"
-							@update:modelValue="label = $event"
-							@blur="measure.measure_name = label"
-							@keydown.enter="measure.measure_name = label"
+							@change="rename"
 						/>
-					</InlineFormControlLabel>
+						<Tooltip :text="__('Remove')">
+							<Button
+								variant="ghost"
+								icon="lucide-trash-2"
+								:aria-label="__('Remove')"
+								@click="handleRemove"
+							/>
+						</Tooltip>
+					</div>
+
+					<p v-if="props.valueHeading" class="mt-1 text-xs-medium text-ink-gray-8">
+						{{ __('Value') }}
+					</p>
 
 					<InlineFormControlLabel v-if="props.enableFormat" :label="__('Unit')">
 						<FormControl
@@ -434,18 +457,6 @@ function handleRemove() {
 					</InlineFormControlLabel>
 
 					<slot name="config-fields" :close="closeSettings" />
-
-					<div class="flex gap-1">
-						<Button
-							class="w-full"
-							variant="outline"
-							theme="red"
-							iconLeft="lucide-x"
-							@click="handleRemove"
-						>
-							Remove
-						</Button>
-					</div>
 				</div>
 			</template>
 		</Popover>

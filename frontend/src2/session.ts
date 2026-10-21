@@ -10,6 +10,8 @@ type SessionUser = {
 	is_admin: boolean
 	is_user: boolean
 	can_download: boolean
+	/** Whether this user may add or change Trusted code. */
+	can_write_trusted_code: boolean
 	locale: string
 	has_desk_access?: boolean
 	has_demo_data: boolean
@@ -23,12 +25,17 @@ type SiteInfo = {
 	country: string
 	/** The day a week is counted from, as `Insights Settings` names it. */
 	week_starts_on: string
-	/** The date a fiscal year starts on, as `Insights Settings` holds it. */
+	/** The date a fiscal year starts on: `Insights Settings`, else ERPNext's current Fiscal Year. */
 	fiscal_year_start: string
 	// stands in for a measure that names no currency column
 	currency: string | null
 	// starts with the site currency; each result adds its codes
 	currency_symbols: Record<string, CurrencySymbol>
+	/** The two properties `docs/telemetry.md` puts on every event. */
+	app_version: string
+	entry: string
+	/** Whether the site is in developer mode. Exporting a workbook to an app needs it. */
+	developer_mode: boolean
 }
 
 const emptySite: SiteInfo = {
@@ -37,6 +44,9 @@ const emptySite: SiteInfo = {
 	fiscal_year_start: '1995-04-01',
 	currency: null,
 	currency_symbols: {},
+	app_version: '',
+	entry: '',
+	developer_mode: false,
 }
 
 const emptyUser: SessionUser = {
@@ -48,6 +58,7 @@ const emptyUser: SessionUser = {
 	is_admin: false,
 	is_user: false,
 	can_download: true,
+	can_write_trusted_code: false,
 	locale: 'en-US',
 	has_demo_data: false,
 }
@@ -90,6 +101,7 @@ async function fetchSessionInfo() {
 		has_desk_access: Boolean(userInfo.has_desk_access),
 		has_demo_data: Boolean(userInfo.has_demo_data),
 		can_download: Boolean(userInfo.can_download),
+		can_write_trusted_code: Boolean(userInfo.can_write_trusted_code),
 	})
 }
 

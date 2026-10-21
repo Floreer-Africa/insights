@@ -3,6 +3,7 @@ import { DatePicker } from 'frappe-ui'
 import { useChartTokens } from 'frappe-ui/charts'
 import { computed, onMounted, ref, watch } from 'vue'
 import FormControl from '../../components/FormControl.vue'
+import NumberInput from '../../components/NumberInput.vue'
 import RadioGroup from '../../components/ui/Radio.vue'
 import RadioGroupItem from '../../components/ui/RadioGroupItem.vue'
 import { flattenOptions } from '../../helpers'
@@ -206,7 +207,7 @@ const rankOperatorOptions = [
 	{ label: __('Below average'), value: 'below_average' as RankOperator },
 ]
 
-// The swatches draw the ramp they pick, so the option cannot name a color the
+// The swatches show the ramp they pick, so the option cannot name a color the
 // scale does not paint. `useChartTokens` needs an element to scope the lookup;
 // an empty ref reads the document, which is where the ramps are defined.
 const { tokens } = useChartTokens(ref<HTMLElement>())
@@ -362,7 +363,7 @@ const isInvalidColumn = computed(() => {
 					>
 						<div class="flex items-center justify-between gap-2 w-full">
 							<span class="text-sm">{{ option.label }}</span>
-							<!-- the empty slot is drawn too: a scale that starts at
+							<!-- the empty slot is shown too: a scale that starts at
 							     nothing should show that it does -->
 							<div class="flex h-2 w-32 rounded-sm ring-1 ring-outline-gray-1">
 								<div
@@ -427,12 +428,11 @@ const isInvalidColumn = computed(() => {
 					:options="operatorOptions"
 					@update:modelValue="onOperatorChange($event)"
 				/>
-				<FormControl
-					type="number"
+				<NumberInput
 					:label="__('Value')"
 					:modelValue="(format as cell_rules).value"
 					:placeholder="__('Value')"
-					@update:modelValue="format.value = Number($event)"
+					@update:modelValue="format.value = $event"
 				/>
 			</template>
 
@@ -491,16 +491,15 @@ const isInvalidColumn = computed(() => {
 					@update:modelValue="onOperatorChange($event)"
 				/>
 				<template v-if="isRankValueRule">
-					<FormControl
+					<NumberInput
 						:label="__('How many')"
-						type="number"
 						:modelValue="(format as rank_rules).value"
 						:placeholder="
 							(format as rank_rules).operator?.includes('percent')
 								? __('A percentage, 1 to 100')
 								: __('A number of rows')
 						"
-						@update:modelValue="format.value = Number($event)"
+						@update:modelValue="format.value = $event"
 					/>
 				</template>
 			</template>

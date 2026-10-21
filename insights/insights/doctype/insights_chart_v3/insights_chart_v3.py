@@ -4,32 +4,37 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import getdate
+from frappe.utils import add_to_date, get_datetime, getdate
 
-from insights.api.shared import stored_dashboard_items
+from insights import standard, user_permissions
+from insights.desk import claims_on, refuse_delete_while_claimed
+from insights.insights.doctype.insights_chart_v3.chart_drill import check_rows
 from insights.insights.doctype.insights_chart_v3.chart_query import (
     column_granularity,
     comparison_sources,
     comparison_timespans,
     config_errors,
+    dashboard_period,
     derive_operations,
+    grain_step,
+    normalize_chart_config,
     period_column,
+    period_grain,
     reads_newest_first,
     sparkline_operations,
 )
 from insights.insights.doctype.insights_chart_v3.record_link import record_links
-from insights.insights.doctype.insights_dashboard_v3.insights_dashboard_v3 import (
-    route_card_filters,
-    route_filters,
-)
+from insights.insights.doctype.insights_dashboard_v3.insights_dashboard_v3 import route_card_filters
 from insights.insights.doctype.insights_query_v3.insights_query_v3 import import_query
-from insights.insights.query_builders.sql_functions import resolve_timespan
-from insights.utils import deep_convert_dict_to_dict
+from insights.insights.query_builders.sql_functions import reading_day, resolve_timespan
+from insights.permission_user import runs_as
+from insights.permissions import can_export, can_read_rows
+from insights.utils import deep_convert_dict_to_dict, refuse_delete_while_linked
 
 QUERY = "Insights Query v3"
 
 # A page of an ascending series ends at its oldest rows, so a series cut by the
-# card's own page size would stop short of the number it is drawn under. This is
+# card's own page size would stop short of the number it is plotted under. This is
 # the bound instead: more periods than any period a card is read over.
 SPARKLINE_MAX_POINTS = 1000
 
@@ -41,17 +46,23 @@ class InsightsChartv3(Document):
     from typing import TYPE_CHECKING
 
     if TYPE_CHECKING:
+        from frappe.core.doctype.has_role.has_role import HasRole
         from frappe.types import DF
 
         chart_type: DF.Data | None
         config: DF.JSON | None
+        description: DF.Data | None
         folder: DF.Data | None
-        is_public: DF.Check
+        info: DF.SmallText | None
+        is_standard: DF.Check
+        kept_for_desk: DF.Check
         old_name: DF.Data | None
-        permission_user: DF.Link | None
         query: DF.Link | None
+        run_as_owner: DF.Check
         sort_order: DF.Int
         title: DF.Data | None
+        visibility: DF.Literal["Private", "Roles", "Everyone", "Public"]
+        visible_to_roles: DF.TableMultiSelect[HasRole]
         workbook: DF.Link
     # end: auto-generated types
 
@@ -61,44 +72,94 @@ class InsightsChartv3(Document):
         return super().get_valid_dict(*args, **kwargs)
 
     def as_dict(self, *args, **kwargs):
+        from insights.permissions import can_share, can_write, may_move_run_as_owner
+
         d = super().as_dict(*args, **kwargs)
-        d.read_only = not self.has_permission("write")
+        d.read_only = not can_write(self)
+        d.can_share = can_share(self)
+        d.can_move_run_as_owner = may_move_run_as_owner(self)
         return d
 
     def validate(self):
-        from insights.permissions import check_chart_query_access
-
-        check_chart_query_access(self)
-
-    @frappe.whitelist()
-    def update_access(self, is_public: bool):
-        """Publish this chart, or withdraw it.
-
-        Publishing is a grant of the publisher's own read access to everyone
-        with the link, so it is the `share` permission and not `write`. The
-        publisher is recorded here because the public execution has no caller of
-        its own to filter rows by. `is_public` and `permission_user` are both
-        permlevel 1, so this method is the only way in.
-
-        The `query` link needs no check here. This writes neither link nor
-        content, and a caller who reached this method can read the chart, which
-        `_build_query_permission_query` already turns into read on its query.
-        """
-        if not frappe.has_permission("Insights Chart v3", ptype="share", doc=self.name):
-            frappe.throw(frappe._("You do not have permission to share this chart"), frappe.PermissionError)
-
-        is_public = bool(frappe.parse_json(is_public))
-        self.db_set(
-            {
-                "is_public": int(is_public),
-                "permission_user": frappe.session.user if is_public else None,
-            }
+        from insights.permissions import (
+            check_chart_query_access,
+            check_trusted_code_author,
+            validate_run_as_owner,
+            validate_visibility,
         )
 
+        standard.guard_member(self)
+        before = self.get_doc_before_save()
+        check_trusted_code_author([(self.title, self.config, before and before.config)])
+        # copied from the workbook, never from the request. A standard chart
+        # reads its tables past the site's team grants
+        self.is_standard = standard.is_standard_member(self)
+        check_chart_query_access(self)
+        validate_visibility(self)
+        validate_run_as_owner(self)
+        self.normalize_config()
+
+    def normalize_config(self):
+        """The config stored in the shape every reader reads, whoever wrote it.
+
+        The builder is one writer of a config. A workbook import and a file
+        another app ships are the others, and either can deliver a shape an
+        older release wrote. Every one of them arrives here, so this is where an
+        older shape stops being stored.
+        """
+        config = frappe.parse_json(self.config)
+        if isinstance(config, dict):
+            self.config = normalize_chart_config(config, self.chart_type)
+
+    def on_update(self):
+        from insights.permissions import capture_visibility_widened
+
+        standard.export_member(self)
+        capture_visibility_widened(self)
+
+    def before_rename(self, old_name, new_name, merge=False):
+        standard.guard_member(self)
+
+    def after_rename(self, old_name, new_name, merge=False):
+        standard.export_member(self)
+
     def on_trash(self):
+        standard.guard_member(self)
+        if not self.flags.force_delete:
+            refuse_delete_while_claimed(self.title or self.name, claims_on(self.doctype, {"name": self.name}))
+            refuse_delete_while_linked(self, taken=("Insights Dashboard v3",))
+        self.remove_from_dashboards()
+
         # Clean up empty folders
         if self.folder:
             self.cleanup_empty_folder(self.folder)
+
+    def remove_from_dashboards(self):
+        """Remove this chart's cells and filter links from every dashboard.
+
+        A dashboard's `linked_charts` table links to the chart. Without this,
+        Frappe refuses to delete a chart that any dashboard uses.
+        """
+        dashboards = frappe.get_all(
+            "Insights Dashboard Chart v3",
+            filters={"chart": self.name, "parenttype": "Insights Dashboard v3"},
+            pluck="parent",
+            distinct=True,
+        )
+        for name in dashboards:
+            dashboard = frappe.get_doc("Insights Dashboard v3", name)
+            items = []
+            for item in frappe.parse_json(dashboard.items) or []:
+                if item.get("type") == "chart" and item.get("chart") == self.name:
+                    continue
+                if item.get("type") == "filter":
+                    (item.get("links") or {}).pop(self.name, None)
+                items.append(item)
+            dashboard.items = frappe.as_json(items)
+            dashboard.save(ignore_permissions=True)
+
+    def after_delete(self):
+        standard.export_member(self)
 
     def cleanup_empty_folder(self, folder_name):
         """Delete folder if it has no queries or charts"""
@@ -116,87 +177,134 @@ class InsightsChartv3(Document):
         if not has_items:
             frappe.delete_doc("Insights Folder", folder_name, force=True, ignore_permissions=True)
 
-    @frappe.whitelist()
-    def get_data(
+    def fetch(
         self,
         force: bool = False,
-        page: int = 1,
-        page_size: int | None = None,
-        dashboard_items: list | None = None,
-        dashboard: str | None = None,
-        filters: dict | None = None,
+        adhoc_filters: dict | None = None,
         card_filters: list | None = None,
+        page: int = 1,
+        order_by: list | None = None,
     ):
-        """Fetch this chart's rows, for a surface that reads the saved chart.
+        """Fetch this chart's rows under the permissions declared on this document.
 
-        A request may name a chart but must not describe one: `run_doc_method`
-        builds `self` out of the request payload, so the stored chart is re-read
-        here and it alone decides the query that runs.
+        It uses this document as given: a View loads it from the stored row,
+        with the Period a dashboard lent it. A page holds the `limit` the
+        author saved. Only a caller that `can_read_rows` allows gets a later
+        page. Anyone else gets the first page.
 
-        Dashboard filter state arrives unrouted, as the grid's `dashboard_items`
-        and the `filters` state, and `route_filters` decides which query each
-        filter lands on, the same way it does for the builder's own feed in
-        `insights.api.authoring`. The links are followed under this chart's own
-        name, so another card's links cannot reach these rows.
-
-        A reader who follows a share link sends no `dashboard_items`: a link
-        names a query and a column, so a routing table from the request is a
-        reader naming columns nobody published. The link names its `dashboard`
-        instead, and the routing table is read from that dashboard's stored
-        items, for a guest and a signed-in reader alike.
+        `adhoc_filters` arrives already routed, keyed by query name.
 
         `card_filters` is the reader's own filter on this one card. It names a
-        column the card draws, and it lands on the card's own derived query, so
+        column the card shows, and it lands on the card's own derived query, so
         it is taken from the request on every surface.
+
+        `order_by` is the reader's own sort, in place of the chart's. Like a later
+        page it brings rows past the chart's `limit` into view, so only a caller
+        that `can_read_rows` allows gets it.
 
         A span card's sparkline comes back under `sparkline`. It runs here
         and not through a call of its own so that a client never has to know
         which cards need a second fetch, and so that a filter cannot reach one
         execution and miss the other.
         """
-        chart = frappe.get_doc(self.doctype, self.name)
-        # a caller that names no page size gets the one the author configured, the
-        # same answer the builder's own feed gives for this chart
-        page_size = page_size or frappe.parse_json(chart.config or "{}").get("limit") or 100
-        adhoc_filters = None
-        if filters:
-            items = (
-                dashboard_items
-                if dashboard_items is not None
-                else stored_dashboard_items(self.name, dashboard)
-            )
-            adhoc_filters = route_filters(items, self.name, filters)
+        if not can_read_rows(self):
+            page = 1
+            order_by = None
+        page_size = frappe.parse_json(self.config or "{}").get("limit") or 100
+        # every span in this fetch resolves against this day. A drill sends it
+        # back, so the drill cuts rows for the same day
+        read_on = str(getdate(reading_day()))
         adhoc_filters = route_card_filters(self.name, card_filters, adhoc_filters)
 
-        query = chart.get_query()
-        result = query.execute(
-            force=force,
-            page=page,
-            page_size=page_size,
-            adhoc_filters=adhoc_filters,
-        )
-        # A reading surface answers with rows and nothing about how they were
-        # fetched. The SQL names tables, joins and columns the reader was never
-        # published, and a public link opens this method to a guest. The builder
-        # asks `insights.api.authoring` when it wants the SQL.
+        query = self.get_query(self.get_operations(order_by))
+        with runs_as(self):
+            result = query.execute(
+                force=force,
+                page=page,
+                page_size=page_size,
+                adhoc_filters=adhoc_filters,
+            )
+            # read before the sparkline runs, because each build clears what the
+            # last one recorded. Only the session user's scope is sent. A Run as
+            # owner chart is narrowed by the owner's user permissions, and those
+            # name documents this reader may not see
+            scope = user_permissions.scope(frappe.session.user)
+            sparkline = self.get_sparkline_data(force=force, adhoc_filters=adhoc_filters)
+        # The SQL names tables, joins and columns the reader may not see, and
+        # `insights.api.view` serves this to a Guest.
         result.pop("sql", None)
 
-        result["rows"] = chart.periods_oldest_last(result["rows"])
-
-        sparkline = chart.get_sparkline_data(force=force, adhoc_filters=adhoc_filters)
+        result["rows"] = self.periods_oldest_last(result["rows"])
 
         # the client formats and links by these, and a reading surface is the
         # only place it can learn them
-        operations = chart.get_operations()
+        operations = self.get_operations()
         result["granularity"] = column_granularity(operations)
         if links := record_links(operations, result["columns"]):
             result["record_links"] = links
 
+        # the reader's user permissions that narrowed these rows. Without it, a
+        # narrowed number looks like the total
+        result["scope"] = scope
+
         if sparkline:
             result["sparkline"] = sparkline
-        if rows := chart.comparison_rows(result["rows"]):
+        if rows := self.comparison_rows(result["rows"]):
             result["comparison_rows"] = rows
+        result["read_on"] = read_on
         return result
+
+    def take_dashboard_period(self, adhoc_filters: dict | None) -> dict | None:
+        """Read the dashboard's span as this card's Period when it states none,
+        and return the routed filters left to apply.
+
+        Every reader of the config follows (derivation, the comparison rows,
+        the sparkline, a drill), so this runs once, where routed filters meet
+        the chart. See `dashboard_period`.
+        """
+        config = frappe.parse_json(self.config or "{}")
+        window, adhoc_filters = dashboard_period(self.chart_type, self.query, config, adhoc_filters)
+        if window:
+            self.config = frappe.as_json({**config, "window": window})
+            self.flags.dashboard_period = window
+        return adhoc_filters
+
+    def count_rows(
+        self,
+        adhoc_filters: dict | None = None,
+        card_filters: list | None = None,
+        force: bool = False,
+    ) -> int:
+        """The total row count behind the pages of `fetch`, under the same filters.
+
+        Only for a caller that `can_read_rows` allows, because the count tells
+        more than the chart shows. It uses this document as given: a view loads
+        it from the stored row, and the builder sends its unsaved config.
+        """
+        check_rows(self)
+        adhoc_filters = route_card_filters(self.name, card_filters, adhoc_filters)
+        with runs_as(self):
+            return self.get_query().count_rows(adhoc_filters=adhoc_filters, force=force)
+
+    def export_rows(
+        self,
+        format: str = "csv",
+        adhoc_filters: dict | None = None,
+        card_filters: list | None = None,
+        order_by: list | None = None,
+    ) -> str:
+        """Every row behind the pages of `fetch`, as a file, under the same filters.
+
+        The rows are the chart's summarized rows, as the chart shows them, not
+        the rows of its query. A refusal by `can_export` raises. It does not
+        answer with empty rows the way a read does.
+        """
+        if not can_export(self):
+            frappe.throw(_("You are not allowed to download data"), exc=frappe.PermissionError)
+        adhoc_filters = route_card_filters(self.name, card_filters, adhoc_filters)
+        with runs_as(self):
+            query = self.get_query(self.get_operations(order_by))
+            return query.export_rows(format, adhoc_filters=adhoc_filters)
 
     def periods_oldest_last(self, rows: list[dict]) -> list[dict]:
         """The rows the card reads, in the order every reader expects them.
@@ -217,14 +325,16 @@ class InsightsChartv3(Document):
         comparison, and they come back oldest first, each named by the date it
         starts on.
 
-        Answered here because the answer is a date. A span carries none until
+        Answered here because the answer is a date. A span has none until
         the query runs, and the same span resolved a second time in the browser
         would be resolved against a different clock and a different fiscal
         calendar.
 
         A grain period fetches nothing beside itself, since every period it has
-        is already a row, so the period before this one is the row before the
-        last, and that is the whole of what it can answer.
+        is already a row. The period before this one is the last row's period
+        stepped back one grain, looked up by its date: the row before the last
+        is some earlier period when the data has a gap. That is the whole of
+        what a grain can answer.
 
         A source with no row to read is named with `None`: the question stands
         and the card prints it with no figure. A source that is missing is one
@@ -234,19 +344,25 @@ class InsightsChartv3(Document):
             return {}
 
         config = frappe.parse_json(self.config or "{}")
+        column = period_column(self.chart_type, config)
         timespans = comparison_timespans(self.chart_type, config)
         if not timespans:
             if "previous" not in comparison_sources(self.chart_type, config):
                 return {}
-            return {"previous": len(rows) - 2 if len(rows) > 1 else None}
+            grain = period_grain(self.chart_type, config)
+            last = rows[-1].get(column)
+            if not grain or not last:
+                return {"previous": None}
+            starts = {get_datetime(row[column]): index for index, row in enumerate(rows) if row.get(column)}
+            back = {unit: -count for unit, count in grain_step(grain).items()}
+            return {"previous": starts.get(add_to_date(get_datetime(last), **back))}
 
-        column = period_column(self.chart_type, config)
         starts = {getdate(row[column]): index for index, row in enumerate(rows) if row.get(column)}
 
         return {source: starts.get(resolve_timespan(timespan)[0]) for source, timespan in timespans.items()}
 
     def get_sparkline_data(self, force: bool = False, adhoc_filters: dict | None = None):
-        """The series behind this card's sparkline, or nothing when it draws none.
+        """The series behind this card's sparkline, or nothing when it plots none.
 
         Only a card that asks for both a sparkline and a span runs it. Execution
         is limited rather than queued (a dashboard already fills the pool), so a
@@ -262,6 +378,27 @@ class InsightsChartv3(Document):
             adhoc_filters=adhoc_filters,
         )
         return {"columns": result["columns"], "rows": result["rows"]}
+
+    def last_modified(self) -> str | None:
+        """The newest `modified` of the stored chart and of every query it reads.
+
+        A drill sends this back from the card and is refused if it changed. The
+        drill cuts the queries as they are now, so after an edit its rows would
+        not match the number on the card.
+
+        It is read from the stored rows by name. So the builder's preview of a
+        saved chart gets the saved version, and the unsaved config in the
+        request does not count. `None` when no chart has this name.
+        """
+        stored = frappe.db.get_value(self.doctype, self.name, ["modified", "query"], as_dict=True)
+        if not stored:
+            return None
+
+        from insights.insights.query_utils import transitive_closure
+
+        queries = {stored.query, *transitive_closure(stored.query)} if stored.query else set()
+        modified = frappe.get_all(QUERY, filters={"name": ["in", list(queries)]}, pluck="modified")
+        return str(max([stored.modified, *modified]))
 
     def get_query(self, operations: list | None = None):
         """A query document for this chart's operations, made to run and thrown away.
@@ -279,21 +416,38 @@ class InsightsChartv3(Document):
         query.title = self.title
         query.workbook = self.workbook
         query.operations = frappe.as_json(self.get_operations() if operations is None else operations)
-        query.use_live_connection = frappe.db.get_value(QUERY, self.query, "use_live_connection")
+        source = (
+            frappe.db.get_value(
+                QUERY,
+                self.query,
+                ["use_live_connection", "is_native_query", "is_script_query", "is_builder_query"],
+                as_dict=True,
+            )
+            or frappe._dict()
+        )
+        # a chart run belongs to the editor its source query was written in, which
+        # is what a failure report names it by
+        query.use_live_connection = source.use_live_connection
+        query.is_native_query = source.is_native_query
+        query.is_script_query = source.is_script_query
+        query.is_builder_query = source.is_builder_query
         query.flags.execution_reference = self.query
         return query
 
-    def get_operations(self):
+    def get_operations(self, order_by: list | None = None):
         """The operations that produce the chart's rows.
 
         The source query, the chart's own filters, its summarize or pivot, and its
-        sort, derived here from the config every time the chart runs. This used to
-        be read off a second query document the browser filled in, and a chart no
-        browser had visited fell back to drawing its source query: a whole shipped
-        workbook rendered raw tables, every number wrong and nothing said so. A config
-        that cannot be drawn is an error, not a row set.
+        sort, derived here from the config every time the chart runs. A config
+        that cannot be rendered raises an error. A fallback to the source query
+        would show its raw rows under the chart's title.
+
+        `order_by` is a reader's sort, in the config's shape, replacing the
+        chart's own.
         """
         config = frappe.parse_json(self.config or "{}")
+        if order_by is not None:
+            config["order_by"] = reader_order(order_by)
         errors = config_errors(self.chart_type, self.query, config)
         if errors:
             frappe.throw(
@@ -304,6 +458,13 @@ class InsightsChartv3(Document):
             )
 
         return derive_operations(self.chart_type, self.query, config)
+
+    @frappe.whitelist()
+    def published_reach(self):
+        """See `insights.permissions.published_reach`."""
+        from insights.permissions import published_reach
+
+        return published_reach(self)
 
     @frappe.whitelist()
     def export(self):
@@ -317,6 +478,8 @@ class InsightsChartv3(Document):
             "doc": {
                 "name": self.name,
                 "title": self.title,
+                "description": self.description,
+                "info": self.info,
                 "workbook": self.workbook,
                 "query": self.query,
                 "chart_type": self.chart_type,
@@ -335,8 +498,19 @@ class InsightsChartv3(Document):
 
     @frappe.whitelist()
     def duplicate(self):
+        """Copy this chart, with visibility set to Private.
+
+        `copy_doc` copies every field that is not `no_copy`, including
+        `visibility`. The copier may not be allowed to publish at that level,
+        and `validate_visibility` treats a new document at any level as a
+        widening. So the copy starts at Private, like a new chart.
+        """
+        from insights.permissions import PRIVATE
+
         new_chart = frappe.copy_doc(self)
         new_chart.title = f"{self.title} (Copy)"
+        new_chart.visibility = PRIVATE
+        new_chart.set("visible_to_roles", [])
         new_chart.insert()
         return new_chart.name
 
@@ -374,3 +548,17 @@ def import_chart(chart, workbook):
     new_chart.insert()
 
     return new_chart.name
+
+
+def reader_order(order_by: list) -> list[dict]:
+    """A reader's sort, rebuilt from the column names and directions alone.
+
+    It comes from the request, so nothing else it holds reaches derivation.
+    """
+    order = []
+    for sort in frappe.parse_json(order_by) or []:
+        column_name = ((sort or {}).get("column") or {}).get("column_name")
+        direction = (sort or {}).get("direction")
+        if isinstance(column_name, str) and column_name and direction in ("asc", "desc"):
+            order.append({"column": {"type": "column", "column_name": column_name}, "direction": direction})
+    return order

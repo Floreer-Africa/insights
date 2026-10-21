@@ -70,8 +70,7 @@ function handleSaveVariables(variables: any[]) {
 		.then(() => {
 			showVariablesDialog.value = false
 		})
-		// `updateVariables` has already told the author what went wrong and
-		// rethrown. The dialog stays open over the values it could not save.
+		// eslint-disable-next-line no-restricted-syntax -- `updateVariables` has already told the author what went wrong and rethrown. The dialog stays open over the values it could not save.
 		.catch(() => {})
 }
 </script>
@@ -89,7 +88,12 @@ function handleSaveVariables(variables: any[]) {
 		<div class="relative flex h-[55%] w-full flex-col overflow-hidden rounded-4 border">
 			<div class="flex flex-1 overflow-hidden">
 				<div class="flex-1">
-					<Code v-model="code" language="python" :placeholder="placeholder_script" />
+					<Code
+						v-model="code"
+						language="python"
+						:placeholder="placeholder_script"
+						:read-only="!session.user.can_write_trusted_code"
+					/>
 				</div>
 
 				<transition

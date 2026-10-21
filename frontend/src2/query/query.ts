@@ -1,5 +1,4 @@
 import { useDebouncedRefHistory } from '@vueuse/core'
-import { Buffer } from 'buffer'
 import { isEqual } from 'es-toolkit'
 import { call, dayjs, toast } from 'frappe-ui'
 import { computed, reactive, ref, toRefs, unref, watch } from 'vue'
@@ -16,6 +15,7 @@ import {
 import { confirmDialog } from '../helpers/confirm_dialog'
 import { FIELDTYPES } from '../helpers/constants'
 import useDocumentResource from '../helpers/resource'
+import { useResultExport } from '../helpers/result_export'
 import { __ } from '../translation'
 import session from '../session'
 import { isServerBusyError, scheduleQueryExecution } from './execution_queue'
@@ -80,6 +80,12 @@ export default function useQuery(name: string) {
 	const query = makeQuery(name)
 	queries.set(key, query)
 	return query
+}
+
+// A query some surface already opened, without opening it: a lookup that only
+// wants to read one must not cost a load.
+export function openedQuery(name: string): Query | undefined {
+	return queries.get(String(name))
 }
 
 // throwaway queries are never looked up by name, so keep them out of the shared
@@ -153,8 +159,6 @@ export function makeQuery(name: string) {
 	const executionError = ref('')
 	const result = ref(emptyResult())
 	const executing = ref(false)
-	const downloading = ref(false)
-	const currentDownloadToken = ref<number | null>(null)
 	const currentPage = ref(1)
 	const pageSize = ref(100)
 	const lastExecutionArgs = ref<{
@@ -294,18 +298,26 @@ export function makeQuery(name: string) {
 		}
 
 		fetchingCount.value = true
-		return scheduleQueryExecution(() =>
-			query.call('get_count', {
-				active_operation_idx: activeOperationIdx.value,
-				adhoc_filters: adhocFilters.value,
-			}),
+		return (
+			scheduleQueryExecution(() =>
+				query.call('get_count', {
+					active_operation_idx: activeOperationIdx.value,
+					adhoc_filters: adhocFilters.value,
+				}),
+			)
+				.then((count: number) => {
+					result.value.totalRowCount = count || 0
+				})
+				// An empty count is a real zero, so the endpoint throws when the
+				// reader may not read the data. Without this, the previous run's
+				// total stays on screen.
+				.catch(() => {
+					result.value.totalRowCount = 0
+				})
+				.finally(() => {
+					fetchingCount.value = false
+				})
 		)
-			.then((count: number) => {
-				result.value.totalRowCount = count || 0
-			})
-			.finally(() => {
-				fetchingCount.value = false
-			})
 	}
 
 	async function formatSQL(args: SQLArgs): Promise<string> {
@@ -592,81 +604,22 @@ export function makeQuery(name: string) {
 		activeOperationIdx.value = newOperations.length - 1
 	}
 
-	function exportResults(format: string = 'csv', filename?: string) {
-		downloading.value = true
-		const token = Date.now() + Math.random()
-		currentDownloadToken.value = token
-		return call('insights.api.run_doc_method', {
-			method: 'download_results',
-			docs: {
-				...(query.doc || {}),
-				__islocal: query.islocal,
-			},
-			args: {
-				format,
-				active_operation_idx: activeOperationIdx.value,
-				adhoc_filters: adhocFilters.value,
-			},
-		})
-			.then((payload: any) => {
-				if (currentDownloadToken.value !== token) return
-				const data: string = payload?.message
-				if (!data) {
-					toast.warning(__('Download Failed'), {
-						description: __('No data found to download.'),
-					})
-					return
-				}
-
-				let blob: Blob
-				let extension: string
-				let mimeType: string
-
-				if (format === 'excel') {
-					const bytes = Buffer.from(data, 'base64')
-					blob = new Blob([bytes], {
-						type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-					})
-					extension = 'xlsx'
-					mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-				} else {
-					blob = new Blob([data], { type: 'text/csv' })
-					extension = 'csv'
-					mimeType = 'text/csv'
-				}
-
-				const url = window.URL.createObjectURL(blob)
-				const a = document.createElement('a')
-				a.setAttribute('hidden', '')
-				a.setAttribute('href', url)
-				const finalFileName = `${filename || query.doc.title || 'data'}.${extension}`
-				a.setAttribute('download', finalFileName)
-				document.body.appendChild(a)
-				a.click()
-				document.body.removeChild(a)
-				window.URL.revokeObjectURL(url)
-				toast.success(__('Export Successful'), {
-					description: __(`File "{0}" exported successfully`, finalFileName),
-				})
-			})
-			.catch((error: any) => {
-				if (currentDownloadToken.value !== token) return
-				toast.error(__('Download Failed'), {
-					description: error?.message || __('Failed to download file'),
-				})
-			})
-			.finally(() => {
-				if (currentDownloadToken.value === token) {
-					downloading.value = false
-					currentDownloadToken.value = null
-				}
-			})
-	}
-
-	function cancelDownload() {
-		currentDownloadToken.value = null
-		downloading.value = false
-	}
+	const { downloading, exportResults, cancelDownload } = useResultExport(
+		(format) =>
+			call('insights.api.run_doc_method', {
+				method: 'download_results',
+				docs: {
+					...(query.doc || {}),
+					__islocal: query.islocal,
+				},
+				args: {
+					format,
+					active_operation_idx: activeOperationIdx.value,
+					adhoc_filters: adhocFilters.value,
+				},
+			}).then((payload: any) => payload?.message),
+		() => query.doc.title,
+	)
 
 	// `adhoc_filters` is an argument so a caller listing the values of a filter it
 	// is editing can leave that filter out, which is the only way picking a second
@@ -869,7 +822,7 @@ export function makeQuery(name: string) {
 		...toRefs(query),
 
 		// a saved query has a document to wait for, a throwaway one never does —
-		// either way this is when there is something to draw a table from
+		// either way this is when there is something to render a table from
 		ready: computed(() => query.isloaded || query.islocal),
 
 		activeOperationIdx,

@@ -1,7 +1,6 @@
 import { watchDebounced } from '@vueuse/core'
 import { __ } from '../translation'
 import { debounce, isEqual } from 'es-toolkit'
-import { toPng } from 'html-to-image'
 import { call, toast } from 'frappe-ui'
 import type { Socket } from 'socket.io-client'
 import {
@@ -134,36 +133,63 @@ export function store<T>(key: string, value: () => T) {
 	return stored ? JSON.parse(stored) : value()
 }
 
+// what frappe-ui puts in `messages` when the server sent no message
+const NO_SENTENCE = 'Internal Server Error'
+
+/**
+ * The message to show the user for a failed request.
+ *
+ * The server's own message comes first. Frappe sends it to every user, but
+ * sends the traceback in `exc` only to a System User. The traceback's exception
+ * line is used only when the server sent no message. Frappe writes the message
+ * as HTML for desk. This app shows it as text, so the markup is removed.
+ */
 export function getErrorMessage(err: any) {
-	const lastLine = err.exc
-		?.split('\n')
-		.filter(Boolean)
-		.at(-1)
-		?.trim()
-		.split(': ')
-		.slice(1)
-		.join(': ')
-	return lastLine || err.message || err.toString()
+	const sentence = err.messages?.filter((message: string) => message !== NO_SENTENCE).at(-1)
+	if (sentence) return asText(sentence)
+
+	// the exception line is not always last: DuckDB appends the offending SQL and a caret
+	const lines: string[] = err.exc?.split('\n') ?? []
+	const excLine = lines.filter((line) => /^[\w.]+(Error|Exception): /.test(line)).at(-1)
+	if (!excLine) return err.message || err.toString()
+	const message = excLine.split(': ').slice(1).join(': ')
+	const details = lines.slice(lines.lastIndexOf(excLine) + 1)
+	return [message, ...details].join('\n').trim()
 }
 
+function asText(html: string) {
+	return html
+		.replace(/<[^>]*>/g, '')
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&amp;/g, '&')
+}
+
+export function showErrorToast(err: Error, raise: false): void
+export function showErrorToast(err: Error, raise?: true): never
 export function showErrorToast(err: Error, raise = true) {
 	toast.error(getErrorMessage(err))
 	if (raise) throw err
 }
 
 export function downloadImage(element: HTMLElement, filename: string, scale = 2, options = {}) {
-	return toPng(element, {
-		width: element.scrollWidth,
-		height: element.scrollHeight,
-		pixelRatio: scale,
-		backgroundColor: 'white',
-		style: {
-			width: `${element.scrollWidth}px`,
-			height: `${element.scrollHeight}px`,
-			overflow: 'visible',
-		},
-		...options,
-	})
+	return import('html-to-image')
+		.then(({ toPng }) =>
+			toPng(element, {
+				width: element.scrollWidth,
+				height: element.scrollHeight,
+				pixelRatio: scale,
+				backgroundColor: 'white',
+				style: {
+					width: `${element.scrollWidth}px`,
+					height: `${element.scrollHeight}px`,
+					overflow: 'visible',
+				},
+				...options,
+			}),
+		)
 		.then((dataUrl) => {
 			const link = document.createElement('a')
 			link.download = filename

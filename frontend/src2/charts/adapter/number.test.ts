@@ -2,14 +2,14 @@ import { describe, expect, it } from 'vitest'
 import { emptyResult } from '../../query/helpers'
 import { ROW_HEIGHT } from '../../dashboard/grid_placement'
 import type { NumberChartConfig } from '../../types/chart.types'
-import { numberChart, type NumberChartSpec } from './fixtures'
+import { numberChart, loadedComponent, type NumberChartSpec } from './fixtures'
 import { defaultComparisonLabel, numberCardRows } from './number'
-import { adaptChart, drawsOwnCards } from './index'
+import { adaptChart, rendersOwnCards } from './index'
 import NumberCards from '../components/NumberCards.vue'
 
 function adapt(spec: NumberChartSpec) {
 	const filler = adaptChart(numberChart(spec))
-	if (!filler) throw new Error('the adapter drew nothing for this Chart')
+	if (!filler) throw new Error('the adapter rendered nothing for this Chart')
 	return filler
 }
 
@@ -29,9 +29,9 @@ const revenue = { name: 'Revenue', readings: [12300] }
 
 describe('a Number Chart with several values', () => {
 	// @feature charts.type-number
-	it('previews every reading, one card behind each of them', () => {
-		// What the workbook editor draws: the chart states three readings, so all
-		// three stand side by side. It draws no chrome — the card around it is the
+	it('previews every reading, one card behind each of them', async () => {
+		// What the workbook editor renders: the chart states three readings, so all
+		// three stand side by side. It renders no chrome — the card around it is the
 		// one every other chart type gets.
 		const { component, props } = adapt({
 			values: [
@@ -41,15 +41,15 @@ describe('a Number Chart with several values', () => {
 			],
 		})
 
-		expect(component).toBe(NumberCards)
+		expect(await loadedComponent(component)).toBe(NumberCards)
 		expect(props.cards.map((card: any) => card.title)).toEqual(['Revenue', 'Profit', 'Items'])
 		expect(props.cards.map((card: any) => card.value)).toEqual([100, 40, 7])
 	})
 
 	// @feature dashboard.number-cell-per-reading
 	it('previews the cards at cell size when no cell names a reading', () => {
-		// The editor has no cell to fill, so each card carries the height a cell
-		// of its rows would give it, and the row is told to draw them that way.
+		// The editor has no cell to fill, so each card has the height a cell
+		// of its rows would give it, and the row is told to render them that way.
 		const { props } = adapt({ values: [{ name: 'Revenue', readings: [100] }] })
 		expect(props.preview).toBe(true)
 		expect(props.cards[0].height).toBe(4 * 22 - 16)
@@ -59,8 +59,8 @@ describe('a Number Chart with several values', () => {
 	})
 
 	// @feature charts.number-readings
-	it('draws the cards itself, so the chrome draws none around them', () => {
-		expect(drawsOwnCards('Number')).toBe(true)
+	it('renders the cards itself, so the chrome renders none around them', () => {
+		expect(rendersOwnCards('Number')).toBe(true)
 	})
 
 	// @feature charts.type-number
@@ -74,14 +74,14 @@ describe('a Number Chart with several values', () => {
 	})
 
 	// @feature charts.type-number
-	it('draws nothing until the Chart names a Measure', () => {
+	it('renders nothing until the Chart names a Measure', () => {
 		expect(adaptChart(numberChart({ values: [] }))).toBeUndefined()
 	})
 
 	// @feature charts.number-readings
 	it('stands the grid up from the config alone, so the cards wear the states', () => {
 		// The cards are this type's only surface: a chart still running, or one
-		// that failed, is drawn on them and not on a chrome it does not have. So
+		// that failed, is shown on them and not on a chrome it does not have. So
 		// the grid is built before a result, with a titled card and no reading.
 		const filler = adaptChart({
 			...numberChart({ values: [{ name: 'Revenue', readings: [100] }] }),
@@ -211,6 +211,16 @@ describe('the comparison', () => {
 	})
 
 	// @feature charts.number-comparison
+	it("prints the delta with the reading's own rounding", () => {
+		const card = cardsOf({
+			values: [{ name: 'Revenue', readings: [200, 300], comparison: previousPeriod }],
+			period: monthly,
+			decimal: 2,
+		})[0]
+		expect(card.deltaFormat!(1234.5)).toBe('1,234.50')
+	})
+
+	// @feature charts.number-comparison
 	it('says what the change is measured against, at the grain it was grouped by', () => {
 		expect(cardsOf(previous)[0].deltaCaption).toBe('vs previous month')
 	})
@@ -232,7 +242,7 @@ describe('the comparison', () => {
 		// Derivation returns the shifted span as the row before the last one, so
 		// the figure reads the way a grain's does. What it is called comes from
 		// the shift the period asked for, because the dimension is a span and
-		// carries no grain.
+		// has no grain.
 		const card = cardsOf({
 			values: [
 				{ name: 'Revenue', readings: [200, 300], comparison: { source: 'last year' } },
@@ -256,7 +266,7 @@ describe('the comparison', () => {
 			window: { span: 'last 3 months' },
 		})[0]
 		expect(span.delta).toBe(50)
-		expect(span.deltaCaption).toBe('vs same period 3 months ago')
+		expect(span.deltaCaption).toBe('vs previous 3 months')
 
 		const grain = cardsOf({ values: [asked], period: monthly, window: { grain: 'month' } })[0]
 		expect(grain.delta).toBe(50)
@@ -346,7 +356,7 @@ describe('the comparison', () => {
 
 	// @feature charts.number-comparison-show
 	it("states the gap in the value's own units when asked for a difference", () => {
-		// The gap is money, so it carries the money sign the reading carries.
+		// The gap is money, so it shows the money sign the reading shows.
 		const card = cardsOf({
 			values: [
 				{
@@ -364,7 +374,7 @@ describe('the comparison', () => {
 	})
 
 	// @feature charts.number-comparison-show
-	it('leaves the unit off the gap, because the value line already carries it', () => {
+	it('leaves the unit off the gap, because the value line already shows it', () => {
 		// The card reads "67 days / 45 days": a third "days" on the delta row
 		// says nothing and pushes the caption out of the card.
 		const card = cardsOf({
@@ -455,7 +465,7 @@ describe('the comparison', () => {
 	})
 
 	// @feature charts.number-comparison
-	it('draws no delta row when the comparison names no number to hold the reading against', () => {
+	it('shows no delta row when the comparison names no number to hold the reading against', () => {
 		const card = cardsOf({
 			values: [{ name: 'Revenue', readings: [300], comparison: { source: 'constant' } }],
 		})[0]
@@ -471,7 +481,7 @@ describe('the comparison', () => {
 	})
 })
 
-describe('a card carrying both a target and a comparison', () => {
+describe('a card with both a target and a comparison', () => {
 	// @feature charts.number-target
 	it('aims at the one and moves against the other, each in its own line', () => {
 		const card = cardsOf({
@@ -493,7 +503,7 @@ describe('a card carrying both a target and a comparison', () => {
 
 describe('the sparkline', () => {
 	// @feature charts.number-sparkline
-	it('carries every reading, oldest first, and the color the Chart chose', () => {
+	it('includes every reading, oldest first, and the color the Chart chose', () => {
 		const card = cardsOf({
 			values: [{ name: 'Items', readings: [7, 9, 8] }],
 			period: monthly,
@@ -504,7 +514,7 @@ describe('the sparkline', () => {
 	})
 
 	// @feature charts.number-date-column
-	it('draws none without a Dimension to run the trend along', () => {
+	it('plots none without a Dimension to run the trend along', () => {
 		expect(
 			cardsOf({ values: [{ name: 'Items', readings: [7, 9] }], sparkline: true })[0]
 				.sparkline,
@@ -512,7 +522,7 @@ describe('the sparkline', () => {
 	})
 
 	// @feature charts.number-sparkline
-	it('draws the second run when there is one, not the two rows of a window', () => {
+	it('plots the second run when there is one, not the two rows of a window', () => {
 		// a span card's rows are one per period: the reading and what it is
 		// held against. The trend inside the span is a run of its own.
 		const card = cardsOf({
@@ -526,8 +536,8 @@ describe('the sparkline', () => {
 	})
 
 	// @feature charts.number-sparkline
-	it('draws nothing for a windowed card until its second run lands', () => {
-		// Its own rows are the reading and what it is held against, so drawing
+	it('plots nothing for a windowed card until its second run lands', () => {
+		// Its own rows are the reading and what it is held against, so plotting
 		// them made a two-point line that read as a trend.
 		const card = cardsOf({
 			values: [{ name: 'Items', readings: [40, 60] }],
@@ -554,6 +564,63 @@ describe('the sparkline', () => {
 			[10, 20],
 			[300, 600],
 		])
+	})
+})
+
+describe('the progress bar', () => {
+	const progressOf = (value: NumberChartSpec['values'][number]) =>
+		cardsOf({ values: [{ progress: true, ...value }] })[0].progress
+
+	// @feature charts.number-progress
+	it('fills to how far the reading has come towards its target, in the color the reading chose', () => {
+		expect(
+			progressOf({
+				name: 'Revenue',
+				readings: [300],
+				targetValue: 400,
+				progressColor: '#2490EF',
+			}),
+		).toEqual({ value: 75, color: '#2490EF' })
+	})
+
+	// @feature charts.number-progress
+	it('fills in the reading’s own color when the bar names none', () => {
+		const reading = { name: 'Revenue', readings: [300], targetValue: 400, color: '#E86C13' }
+		expect(progressOf(reading)?.color).toBe('#E86C13')
+		expect(progressOf({ ...reading, progressColor: '#2490EF' })?.color).toBe('#2490EF')
+	})
+
+	// @feature charts.number-progress
+	it('fills a percent reading out of 100% when it aims at nothing', () => {
+		// The Measure holds the fraction, so 0.42 is 42 of the 100 it is out of.
+		expect(progressOf({ name: 'CPU', readings: [0.42], percent: true })?.value).toBeCloseTo(42)
+	})
+
+	// @feature charts.number-progress
+	it('measures a percent reading against its target when it names one', () => {
+		expect(
+			progressOf({ name: 'SLA', readings: [0.42], percent: true, targetValue: 0.5 })?.value,
+		).toBeCloseTo(84)
+	})
+
+	// @feature charts.number-progress
+	it('draws none for a reading with nothing to come towards', () => {
+		expect(progressOf({ name: 'Orders', readings: [1284] })).toBeUndefined()
+		expect(
+			progressOf({ name: 'Revenue', readings: [300], target: [null], targetColumn: true }),
+		).toBeUndefined()
+	})
+
+	// @feature charts.number-progress
+	it('is drawn only for the readings that turn it on', () => {
+		const cards = cardsOf({
+			values: [
+				{ name: 'Revenue', readings: [300], targetValue: 400, progress: true },
+				{ name: 'CPU', readings: [0.42], percent: true },
+			],
+		})
+		expect(cards[0].progress).toEqual({ value: 75 })
+		expect(cards[1].progress).toBeUndefined()
 	})
 })
 
@@ -610,18 +677,51 @@ describe('the rows a Number cell takes', () => {
 	})
 
 	// @feature dashboard.cell-height-rule
-	it('draws no sparkline band without a Dimension to run the trend along', () => {
+	it('adds the progress bar for a reading with a target or a percent, and none without', () => {
+		expect(rowsFor({ values: [{ ...revenue, targetValue: 400, progress: true }] })).toBe(5)
+		expect(rowsFor({ values: [{ ...revenue, percent: true, progress: true }] })).toBe(5)
+		expect(rowsFor({ values: [{ ...revenue, progress: true }] })).toBe(4)
+		expect(rowsFor({ values: [{ ...revenue, targetValue: 400 }] })).toBe(4)
+	})
+
+	// @feature dashboard.cell-height-rule
+	it('adds no progress bar for a target that names no number yet', () => {
+		// Picking "Measure" as the target writes one with no column until the
+		// author picks it, and the card draws no bar for it.
+		for (const target of [
+			{
+				measure: {
+					column_name: '',
+					data_type: 'Decimal',
+					measure_name: '',
+					aggregation: '',
+				},
+			},
+			{ value: null },
+		]) {
+			const spec: NumberChartSpec = { values: [{ ...revenue, progress: true }] }
+			const config = numberChart(spec).config as NumberChartConfig
+			config.number_column_options[0].target = target as any
+			expect(numberCardRows(config)).toBe(4)
+		}
+	})
+
+	// @feature dashboard.cell-height-rule
+	it('plots no sparkline band without a Dimension to run the trend along', () => {
 		expect(rowsFor({ values: [revenue], sparkline: true })).toBe(4)
 	})
 
 	// @feature dashboard.cell-height-rule
 	it('leaves every card less than a row of slack', () => {
-		// What picks the row height: the three heights the card has, and how much
-		// of the last row each of them wastes.
+		// What picks the row height: the heights the card has, with and without a
+		// progress bar, and how much of the last row each of them wastes.
 		for (const [rows, height] of [
-			[4, 85.95],
-			[5, 107.95],
-			[7, 147.95],
+			[4, 84.55],
+			[5, 108.1],
+			[7, 148.1],
+			[5, 96.55],
+			[6, 120.1],
+			[8, 160.1],
 		]) {
 			expect(rows * ROW_HEIGHT).toBeGreaterThanOrEqual(height)
 			expect(rows * ROW_HEIGHT - height).toBeLessThan(ROW_HEIGHT)
@@ -631,7 +731,7 @@ describe('the rows a Number cell takes', () => {
 
 describe('a Chart naming one Measure twice', () => {
 	// @feature charts.number-readings
-	it('draws it once, because a reading is named by its Measure', () => {
+	it('renders it once, because a reading is named by its Measure', () => {
 		const cards = cardsOf({
 			values: [
 				{ name: 'Revenue', readings: [100] },
@@ -652,7 +752,7 @@ describe('the reading a dashboard cell names', () => {
 	}
 
 	// @feature dashboard.number-cell-per-reading
-	it('is the only card the cell draws', () => {
+	it('is the only card the cell renders', () => {
 		const cards = cardsOf({ ...three, reading: 'Profit' })
 		expect(cards).toHaveLength(1)
 		expect(cards[0]).toMatchObject({ title: 'Profit', value: 40, column: 'Profit' })
@@ -674,14 +774,14 @@ describe('the reading a dashboard cell names', () => {
 	})
 
 	// @feature dashboard.number-cell-per-reading
-	it('carries the settings that stand beside that reading, not another one', () => {
+	it('keeps the settings that stand beside that reading, not another one', () => {
 		expect(cardsOf({ ...three, reading: 'Profit' })[0].color).toBeUndefined()
 		expect(cardsOf({ ...three, reading: 'Revenue' })[0].color).toBe('#2490EF')
 	})
 
 	// @feature dashboard.number-cell-per-reading
 	it('is the first reading when the cell names none', () => {
-		// A cell written before cells could name a reading keeps the reading it drew.
+		// A cell written before cells could name a reading keeps the reading it showed.
 		expect(cardsOf({ ...three, reading: undefined })[0].title).toBe('Revenue')
 	})
 
@@ -700,7 +800,7 @@ describe('a cell naming a reading the Chart no longer states', () => {
 		cardsOf({ values: [{ name: 'Revenue', readings: [100] }], reading: 'Margin' })
 
 	// @feature dashboard.number-cell-per-reading
-	it('draws a card where it stood, so the cell stays until the author removes it', () => {
+	it('renders a card where it stood, so the cell stays until the author removes it', () => {
 		expect(gone()).toHaveLength(1)
 		expect(gone()[0]).toMatchObject({ title: '', missing: true })
 	})

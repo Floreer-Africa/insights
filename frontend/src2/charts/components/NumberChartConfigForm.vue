@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import AddSlotButton from './AddSlotButton.vue'
-import { debounce } from 'frappe-ui'
+import { debounce, Textarea } from 'frappe-ui'
 import { computed } from 'vue'
 import ColorInput from '../../components/ColorInput.vue'
 import DraggableList from '../../components/DraggableList.vue'
 import InlineFormControlLabel from '../../components/InlineFormControlLabel.vue'
 import { getUniqueId } from '../../helpers'
-import { FIELDTYPES } from '../../helpers/constants'
+import { isCalendarDateType } from '../../helpers/constants'
 import { moveNumberReadingOptions, removeNumberReading } from '../helpers'
 import { DEFAULT_CHOICE, periodOf, periodOfChoice } from '../window'
 import { NumberChartConfig, NumberColumnOptions } from '../../types/chart.types'
@@ -33,12 +33,13 @@ const config = defineModel<NumberChartConfig>({
 	}),
 })
 
+// picking a column writes a calendar period, which a time of day cannot hold
 const date_dimensions = computed(() =>
-	props.dimensions.filter((d) => FIELDTYPES.DATE.includes(d.data_type)),
+	props.dimensions.filter((d) => isCalendarDateType(d.data_type)),
 )
 
-// What the card reads, which is what decides whether a period comparison is on
-// offer and whether a sparkline has a series behind it.
+// What the card reads, which is what decides whether a period comparison is
+// available and whether a sparkline has a series behind it.
 const period = computed(() => periodOf(config.value))
 
 const updateColor = debounce((color: string) => {
@@ -68,11 +69,18 @@ function setNumberOption(index: number, option: keyof NumberColumnOptions, value
 	config.value.number_column_options[index][option] = value
 }
 
+// An emptied info leaves no key behind: an `undefined` one reads as an edit,
+// and saves a chart nobody changed.
+function setNumberInfo(index: number, info: string) {
+	if (info) setNumberOption(index, 'info', info)
+	else delete config.value.number_column_options[index]?.info
+}
+
 /**
  * The column and the period are one decision, so one handler answers both.
  *
  * A date column that groups nothing is a date column doing nothing, which is
- * why the picker offers no "None" — picking a column picks a period, and
+ * why the picker lists no "None" — picking a column picks a period, and
  * dropping the column drops it. Written only on an author's action, never on
  * open, so no chart is dirtied by being looked at.
  */
@@ -106,6 +114,7 @@ function setDateColumn(dimension?: Dimension) {
 								:column-options="props.columnOptions"
 								:enable-format="true"
 								config-width="19rem"
+								value-heading
 								@update:model-value="Object.assign(item, $event || {})"
 								@remove="removeNumberColumn(index)"
 							>
@@ -124,32 +133,48 @@ function setDateColumn(dimension?: Dimension) {
 										/>
 									</InlineFormControlLabel>
 
-									<Toggle
-										:label="__('Negative is better')"
-										:modelValue="getNumberOption(index, 'negative_is_better')"
-										@update:modelValue="
+									<InlineFormControlLabel :label="__('Info')">
+										<!-- A textarea of one row, so an info with line breaks
+										     keeps them. -->
+										<Textarea
+											:placeholder="__('Shown beside the title')"
+											:rows="1"
+											:model-value="
+												(getNumberOption(index, 'info') as string) ?? ''
+											"
+											@update:model-value="setNumberInfo(index, $event)"
+										/>
+									</InlineFormControlLabel>
+
+									<NumberValueContext
+										:column-options="props.columnOptions"
+										:period="period"
+										:date-column="config.date_column as Dimension"
+										:measure="item"
+										:target="getNumberOption(index, 'target') as any"
+										:comparison="getNumberOption(index, 'comparison') as any"
+										:progress="getNumberOption(index, 'progress') as any"
+										:progress-color="
+											getNumberOption(index, 'progress_color') as any
+										"
+										:negative-is-better="
+											getNumberOption(index, 'negative_is_better') as any
+										"
+										@update:target="setNumberOption(index, 'target', $event)"
+										@update:comparison="
+											setNumberOption(index, 'comparison', $event)
+										"
+										@update:progress="
+											setNumberOption(index, 'progress', $event)
+										"
+										@update:progress-color="
+											setNumberOption(index, 'progress_color', $event)
+										"
+										@update:negative-is-better="
 											setNumberOption(index, 'negative_is_better', $event)
 										"
+										@dialog-open="closeSettings"
 									/>
-
-									<div class="mt-1 border-t pt-2">
-										<NumberValueContext
-											:column-options="props.columnOptions"
-											:period="period"
-											:date-column="config.date_column as Dimension"
-											:target="getNumberOption(index, 'target') as any"
-											:comparison="
-												getNumberOption(index, 'comparison') as any
-											"
-											@update:target="
-												setNumberOption(index, 'target', $event)
-											"
-											@update:comparison="
-												setNumberOption(index, 'comparison', $event)
-											"
-											@dialog-open="closeSettings"
-										/>
-									</div>
 								</template>
 							</MeasurePicker>
 						</template>

@@ -1,7 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '../fixtures'
 import { INSIGHTS_PATH, VIEWER_EMAIL } from '../helpers/auth'
-import { deleteWorkbook } from '../helpers/insights'
+import { createQuery, deleteWorkbook } from '../helpers/insights'
 
 /**
  * locator: the workbook navbar has no landmark role, and its title is a
@@ -30,7 +30,7 @@ function itemTitle(page: Page, scale: string): Locator {
 
 /**
  * locator: the workbook actions menu opens from an icon-only button that
- * carries no accessible name. `aria-haspopup` marks it as the only menu trigger
+ * has no accessible name. `aria-haspopup` marks it as the only menu trigger
  * in the navbar.
  */
 function actionsMenu(page: Page): Locator {
@@ -75,7 +75,7 @@ test.describe('workbook', () => {
 
 		// The logo returns to the list without reloading the app.
 		await page.getByRole('link', { name: 'logo' }).click()
-		await page.getByPlaceholder('Search by title').fill(`Workbook ${name}`)
+		await page.getByPlaceholder('Title', { exact: true }).fill(`Workbook ${name}`)
 		await expect(page.getByText(`Workbook ${name}`)).toBeVisible()
 
 		await deleteWorkbook(adminApi, name)
@@ -107,7 +107,7 @@ test.describe('workbook', () => {
 		await expect(page).toHaveURL(
 			new RegExp(`/workbook/${workbook.name}/dashboard/${dashboard.name}$`),
 		)
-		// The dashboard draws the chart narrower, and echarts drops the category
+		// The dashboard renders the chart narrower, and echarts drops the category
 		// labels that no longer fit. The value axis still runs to a 1,800 tick,
 		// because 1,778 of the 2,000 orders are delivered.
 		await expect(rendered.getByText('1,800')).toBeVisible()
@@ -153,7 +153,7 @@ test.describe('workbook', () => {
 		await expectSaved(page)
 
 		await page.getByRole('link', { name: 'logo' }).click()
-		await page.getByPlaceholder('Search by title').fill(renamed)
+		await page.getByPlaceholder('Title', { exact: true }).fill(renamed)
 		await expect(page.getByText(renamed)).toBeVisible()
 		await expect(page.getByText(workbook.title, { exact: true })).toHaveCount(0)
 	})
@@ -191,14 +191,15 @@ test.describe('workbook', () => {
 
 		// Deleting returns the user to the list, without the deleted workbook.
 		await expect(page).toHaveURL(new RegExp(`${INSIGHTS_PATH}/workbook$`))
-		await page.getByPlaceholder('Search by title').fill(workbook.title)
+		await page.getByPlaceholder('Title', { exact: true }).fill(workbook.title)
 		await expect(page.getByText(workbook.title, { exact: true })).toHaveCount(0)
-		await expect(page.getByText('No Workbooks')).not.toHaveCount(0)
+		await expect(page.getByText('No workbooks found')).not.toHaveCount(0)
 	})
 
 	// @feature workbook.folders
-	test('a user creates a folder and moves a query into it', async ({
+	test('a user moves a query into a folder, and the folder opens when the query is opened', async ({
 		page,
+		adminApi,
 		demoDataSource,
 		workbookWithQuery,
 	}) => {
@@ -220,9 +221,22 @@ test.describe('workbook', () => {
 		await folder.click()
 		await expect(item).toBeVisible()
 
+		const other = await createQuery(adminApi, {
+			workbook: workbook.name,
+			dataSource: demoDataSource,
+		})
+
+		// The query is open, so its folder opens with the page.
 		await page.reload()
-		await expect(folder).toBeVisible()
+		await expect(item).toBeVisible()
+		await folder.click()
 		await expect(item).toBeHidden()
+
+		// Returning to the query without a reload opens its folder too.
+		await page.getByRole('link', { name: other.title }).click()
+		await expect(item).toBeHidden()
+		await page.goBack()
+		await expect(item).toBeVisible()
 	})
 
 	// @feature permissions.share-workbook-user
@@ -260,7 +274,7 @@ test.describe('workbook', () => {
 		const item = page.getByRole('link', { name: query.title })
 		await expect(item).toBeVisible()
 
-		// The row's X is the only control on it that carries a name.
+		// The row's X is the only control on it that has a name.
 		await item.hover()
 		await page.getByRole('button', { name: `Remove ${query.title}` }).click()
 

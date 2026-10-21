@@ -1,12 +1,14 @@
-import { toTitleCase } from '../../helpers'
+import { defineAsyncComponent } from 'vue'
+import { toNumber, toTitleCase } from '../../helpers'
 import { FIELDTYPES } from '../../helpers/constants'
 import type { MapChartConfig } from '../../types/chart.types'
 import type { QueryResultRow } from '../../types/query.types'
-import MapChart from '../components/MapChart.vue'
 import { numberFormatter, type NumberFormatter } from '../number_format'
 import type { ChartAdapterInput, ChartFiller } from './types'
 
-// Map is filler 2: Insights draws the plot, on v2's `useChart` and inside v2's
+const MapChart = defineAsyncComponent(() => import('../components/MapChart.vue'))
+
+// Map is filler 2: Insights renders the plot, on v2's `useChart` and inside v2's
 // chrome. What keeps it out of the library is the geography layer — a GeoJSON
 // file, region names that have to be resolved against it, and a classification
 // step. That is data cleaning, and it all lives here, where it can be tested
@@ -16,7 +18,8 @@ import type { ChartAdapterInput, ChartFiller } from './types'
 export type MapRegion = {
 	/** As the geography spells it. This is what echarts matches a shape by. */
 	name: string
-	value: number
+	/** `null` when no row behind it holds a number: a region with nothing measured, not a zero. */
+	value: number | null
 }
 
 /**
@@ -28,6 +31,7 @@ export type MapBucket = { min: number; max: number }
 
 export type MapChartProps = {
 	title?: string
+	subtitle?: string
 	map: NonNullable<MapChartConfig['map_type']>
 	/** Names the measure in the tooltip. */
 	measure: string
@@ -44,10 +48,10 @@ const DEFAULT_MAP = 'world'
 export function adaptMapChart(input: ChartAdapterInput): ChartFiller | undefined {
 	const config = input.config as MapChartConfig
 
-	// The columns the plot is drawn from, not the ones the config names. A
+	// The columns the plot reads, not the ones the config names. A
 	// Dimension renames its output column, so the config's spelling and the
 	// result's need not match — and a drill that indexes a different column
-	// from the one it drew is a click that silently finds nothing.
+	// from the one it plotted is a click that silently finds nothing.
 	const measure = input.result.columns.find((c) => FIELDTYPES.MEASURE.includes(c.type))
 	const location = input.result.columns.find((c) => FIELDTYPES.DIMENSION.includes(c.type))
 	if (!measure || !location) return
@@ -59,6 +63,7 @@ export function adaptMapChart(input: ChartAdapterInput): ChartFiller | undefined
 
 	const props: MapChartProps = {
 		title: input.title,
+		subtitle: input.description,
 		map,
 		measure: measure.name,
 		regions,
@@ -78,21 +83,21 @@ export function adaptMapChart(input: ChartAdapterInput): ChartFiller | undefined
 	}
 }
 
-/** A region the geography can draw, its total, and every row that fed it. */
+/** A region the geography can plot, its total, and every row behind it. */
 type RegionFold = {
 	/** As the geography spells it. This is what echarts matches a shape by. */
 	name: string
-	value: number
+	value: number | null
 	rows: QueryResultRow[]
 }
 
 /**
- * One entry per region the geography can draw, with the rows behind it summed.
+ * One entry per region the geography can plot, with the rows behind it summed.
  * A region mapping is the author's answer to a name the geography does not
- * carry — the gallery's data says `Brasil` where the GeoJSON says `Brazil` —
+ * include — the gallery's data says `Brasil` where the GeoJSON says `Brazil` —
  * and it wins over the automatic title-casing.
  *
- * The one fold. What the plot draws and what a click resolves to are the same
+ * The one fold. What the plot shows and what a click resolves to are the same
  * grouping asked twice: an index built alongside it kept the last row of each
  * region, so a click on a region summed from several drilled into one of them.
  *
@@ -110,27 +115,28 @@ function foldRegions(
 		const raw = row[location]
 		if (raw === null || raw === undefined || raw === '') continue
 		const name = mappings[raw as string] || toTitleCase(String(raw))
-		const region = fold.get(toTitleCase(name)) || { name, value: 0, rows: [] }
-		region.value += Number(row[measure]) || 0
+		const region = fold.get(toTitleCase(name)) || { name, value: null, rows: [] }
+		const value = toNumber(row[measure])
+		if (value !== null) region.value = (region.value ?? 0) + value
 		region.rows.push(row)
 		fold.set(toTitleCase(name), region)
 	}
 	return fold
 }
 
-/** What the plot draws, descending by value, the way the classification reads them. */
+/** What the plot shows, descending by value, the way the classification reads them. */
 function regionsOf(fold: Map<string, RegionFold>): MapRegion[] {
 	return [...fold.values()]
-		.sort((a, b) => b.value - a.value)
+		.sort((a, b) => Number(a.value === null) - Number(b.value === null) || b.value! - a.value!)
 		.map(({ name, value }) => ({ name, value }))
 }
 
 /**
  * The row a click on a region drills into.
  *
- * A region the geography draws as one shape can be several rows — two spellings
+ * A region the geography plots as one shape can be several rows — two spellings
  * of one name, or a mapping that folds them. The drill pins the clicked region,
- * so it is handed every location value that fed the shape rather than one of
+ * so it is handed every location value behind the shape rather than one of
  * them, and the filter it builds is an `in` over the set.
  */
 function rowForRegion(
@@ -149,13 +155,13 @@ function rowForRegion(
  * class boundaries sit where the data already parts, so a choropleth of a long
  * tail does not collapse into one shade.
  *
- * Every number is classified, a loss as much as a profit: a region drawn in the
+ * Every number is classified, a loss as much as a profit: a region shown in the
  * "no row here" shade is one the query returned nothing for, and a reader who
  * cannot tell that from a negative reads the map wrong. The scale opens at the
  * smallest value, so the classes span exactly what the data does.
  */
-function naturalBreaks(values: number[]): MapBucket[] {
-	const valid = values.filter((v) => typeof v === 'number' && !isNaN(v))
+function naturalBreaks(values: (number | null)[]): MapBucket[] {
+	const valid = values.filter((v): v is number => typeof v === 'number' && !isNaN(v))
 	if (!valid.length) return []
 
 	const distinct = [...new Set(valid)].sort((a, b) => a - b)

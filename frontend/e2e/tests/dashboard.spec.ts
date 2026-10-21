@@ -1,7 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '../fixtures'
 import { INSIGHTS_PATH } from '../helpers/auth'
-import { createChart, createDashboard, uniqueTitle } from '../helpers/insights'
+import { createChart, createDashboard, runChartAsOwner, uniqueTitle } from '../helpers/insights'
 
 /**
  * A dashboard item is a grid cell `StaticGridLayout` places, which gives it no
@@ -14,7 +14,7 @@ const items = (page: Page): Locator => page.getByTestId('dashboard-cell')
  * The chart itself. echarts writes `_echarts_instance_` on the element it
  * renders into, so this names the charts and nothing else on the page.
  */
-// locator: an echarts host carries no role and no accessible name.
+// locator: an echarts host has no role and no accessible name.
 const charts = (page: Page): Locator => page.locator('[_echarts_instance_]')
 
 /**
@@ -166,12 +166,11 @@ test.describe('dashboard', () => {
 		// axis runs to the 1,778 delivered orders and tops out at a 1,800 tick.
 		await expect(charts(page).getByText('1,800')).toBeVisible({ timeout: 30_000 })
 
-		// A filter that names its column opens on the operator, then on the values
-		// that column holds. A value list commits when the panel closes, and the
+		// A filter that names its column opens on the values that column holds, under
+		// the default `is`. A value list commits when the panel closes, and the
 		// trigger is what closes it.
 		const trigger = page.getByRole('button', { name: 'Status', exact: true })
 		await trigger.click()
-		await page.getByRole('option', { name: 'is', exact: true }).click()
 		await page.getByRole('option', { name: 'canceled' }).click()
 		await trigger.click()
 
@@ -188,6 +187,26 @@ test.describe('dashboard', () => {
 
 		await expect(trigger).toBeVisible()
 		await expect(page.getByRole('button', { name: 'Status is canceled' })).toHaveCount(0)
+		await expect(charts(page).getByText('1,800')).toBeVisible({ timeout: 30_000 })
+
+		// Unticking every value and clicking away takes the filter off too.
+		await trigger.click()
+		await page.getByRole('option', { name: 'canceled' }).click()
+		await page.getByRole('option', { name: 'shipped' }).click()
+		await trigger.click()
+		const applied = page.getByRole('button', { name: 'Status is canceled, shipped' })
+		await expect(applied).toBeVisible()
+
+		await applied.click()
+		await page.getByRole('option', { name: 'canceled' }).click()
+		await page.getByRole('option', { name: 'shipped' }).click()
+		// Click the card's corner to close the panel. The panel covers the card's top,
+		// and a click on the corner opens nothing.
+		const cell = items(page).filter({ hasText: chart.title })
+		const box = (await cell.boundingBox())!
+		await cell.click({ position: { x: box.width - 4, y: box.height - 4 } })
+
+		await expect(trigger).toBeVisible()
 		await expect(charts(page).getByText('1,800')).toBeVisible({ timeout: 30_000 })
 	})
 
@@ -312,7 +331,7 @@ test.describe('dashboard', () => {
 
 		const item = items(page).filter({ hasText: chart.title })
 		await item.hover()
-		// The item's action bar draws real buttons, and each one carries the
+		// The item's action bar renders real buttons, and each one has the
 		// label of the act it performs.
 		await item.getByRole('button', { name: 'Delete' }).click()
 
@@ -330,13 +349,15 @@ test.describe('dashboard', () => {
 	// @feature shared.dashboard-link
 	test('a user shares a dashboard and opens the public link', async ({
 		page,
+		adminApi,
 		demoDataSource,
 		workbookWithDashboard,
 	}) => {
-		const { workbook, dashboard } = workbookWithDashboard
+		const { workbook, chart, dashboard } = workbookWithDashboard
+		await runChartAsOwner(adminApi, chart.name)
 		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}/dashboard/${dashboard.name}`)
 
-		// The workbook header carries its own Share button, and only the
+		// The workbook header has its own Share button, and only the
 		// dashboard's one names itself through a label.
 		const shareButton = page.getByLabel('Share', { exact: true })
 		await expect(shareButton).toBeVisible()
@@ -344,7 +365,7 @@ test.describe('dashboard', () => {
 
 		const share = page.getByRole('dialog', { name: 'Share Dashboard' })
 		await share.getByPlaceholder('Select an option').click()
-		await page.getByRole('option', { name: 'Anyone with the link can view' }).click()
+		await page.getByRole('option', { name: 'Anyone with the link, including guests' }).click()
 
 		// The toast fires before the write returns, and nothing else on the page
 		// reports it, so the flow waits on the write itself. This is a wait, not
@@ -361,7 +382,7 @@ test.describe('dashboard', () => {
 		await page.reload()
 		await shareButton.click()
 		await expect(share.getByPlaceholder('Select an option')).toHaveValue(
-			'Anyone with the link can view',
+			'Anyone with the link, including guests',
 		)
 	})
 
@@ -390,22 +411,20 @@ test.describe('dashboard', () => {
 		await expect(page.getByRole('button', { name: 'Status', exact: true })).toBeVisible()
 		await page.getByRole('button', { name: 'Done', exact: true }).click()
 
-		// The filter names its own column, so the picker opens on the operator.
+		// The filter names its own column, so the picker opens on the values `is` lists.
 		const trigger = page.getByRole('button', { name: 'Status', exact: true })
 		await trigger.click()
-		await page.getByRole('option', { name: 'is', exact: true }).click()
 
 		// No linked chart names a column, so the filter can read no values from
-		// the data and offers none of the order statuses to pick.
+		// the data and lists none of the order statuses to pick.
 		await expect(popover(page).getByText('No values found')).toBeVisible()
 		await expect(popover(page).getByText('delivered')).toHaveCount(0)
 		await expect(popover(page).getByText('canceled')).toHaveCount(0)
 
 		// A typed value applies all the same, and nothing tells the user that the
-		// filter reaches no chart. The trigger closes the picker, which reopens
-		// on the operator, and `equals` is the one that takes a typed value.
-		await trigger.click()
-		await trigger.click()
+		// filter reaches no chart. Back steps to the operators, and `equals` is
+		// the one that takes a typed value.
+		await popover(page).getByRole('button', { name: 'Back', exact: true }).click()
 		// An operator row reads as its word, with its sign beside it.
 		await page.getByRole('option', { name: 'equals =', exact: true }).click()
 		await popover(page).getByRole('combobox').fill('canceled')
@@ -436,10 +455,8 @@ test.describe('dashboard', () => {
 		await page.getByRole('button', { name: 'Edit', exact: true }).click()
 		await expect(items(page)).toHaveCount(0)
 
-		// locator: the grid's host is the only scrolling box on the dashboard and
-		// carries no role. It is the drop target, and an empty dashboard draws no
-		// grid inside it, so there is nothing else to aim at.
-		const grid = page.locator('div.overflow-y-auto.p-2.pt-0')
+		// An empty dashboard shows no grid. Its empty state is inside the drop target.
+		const grid = page.getByText('This dashboard is empty')
 		await page.getByRole('link', { name: chart.title }).dragTo(grid)
 
 		await expect(items(page).filter({ hasText: chart.title })).toHaveCount(1)
@@ -473,7 +490,7 @@ test.describe('dashboard', () => {
 		await expect(card).toHaveCount(1)
 		await card.hover()
 		// locator: the pencil that opens the chart is an icon-only Button inside a
-		// Tooltip, so it carries no accessible name. Its lucide icon class names
+		// Tooltip, so it has no accessible name. Its lucide icon class names
 		// it inside the card it belongs to.
 		await card.locator('button:has(svg.lucide-pencil)').click()
 
@@ -482,12 +499,18 @@ test.describe('dashboard', () => {
 		await page.goBack()
 		await expect(items(page).filter({ hasText: chart.title })).toHaveCount(1)
 
-		// locator: the dashboard header's overflow menu is an icon-only Button
-		// with no accessible name. `aria-haspopup` marks it as the header's only
-		// menu trigger.
-		await page.getByRole('banner').locator('button[aria-haspopup="menu"]').click()
-		await page.getByRole('menuitem', { name: 'Open Workbook' }).click()
+		// The page header has no landmark role, and its overflow menu is an
+		// icon-only Button with no accessible name. So find it beside Refresh.
+		await page
+			.getByRole('button', { name: 'Refresh', exact: true })
+			.locator('xpath=..')
+			.locator('button[aria-haspopup="menu"]')
+			.click()
+		// The builder belongs to the workbook, so Edit opens the workbook.
+		await page.getByRole('menuitem', { name: 'Edit' }).click()
 
-		await expect(page).toHaveURL(new RegExp(`/workbook/${workbook.name}`))
+		await expect(page).toHaveURL(
+			new RegExp(`/workbook/${workbook.name}/dashboard/${dashboard.name}$`),
+		)
 	})
 })

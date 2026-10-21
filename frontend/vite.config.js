@@ -8,7 +8,7 @@ import { defineConfig, searchForWorkspaceRoot } from 'vite'
 // The real directory `frappe-ui` resolves to. The dev server serves only what
 // its allow-list covers, and the files it is asked for from there are the Inter
 // woff2s. A no-op while the package sits inside the workspace.
-const frappeUIRoot = fs.realpathSync(path.resolve(__dirname, 'node_modules/frappe-ui'))
+const frappeUIRoot = fs.realpathSync(path.resolve(import.meta.dirname, 'node_modules/frappe-ui'))
 
 const echartsEntries = [
 	'echarts/core',
@@ -33,18 +33,13 @@ const tiptapDeps = [
 	'@tiptap/extension-code',
 	'@tiptap/extension-code-block',
 	'@tiptap/extension-code-block-lowlight',
-	'@tiptap/extension-color',
 	'@tiptap/extension-document',
 	'@tiptap/extension-hard-break',
 	'@tiptap/extension-heading',
-	'@tiptap/extension-highlight',
 	'@tiptap/extension-horizontal-rule',
-	'@tiptap/extension-image',
 	'@tiptap/extension-italic',
 	'@tiptap/extension-link',
 	'@tiptap/extension-list',
-	'@tiptap/extension-mention',
-	'@tiptap/extension-node-range',
 	'@tiptap/extension-paragraph',
 	'@tiptap/extension-placeholder',
 	'@tiptap/extension-strike',
@@ -83,12 +78,11 @@ export default defineConfig({
 			allow: [searchForWorkspaceRoot(process.cwd()), frappeUIRoot],
 		},
 	},
-	esbuild: { loader: 'ts' },
 	resolve: {
 		alias: {
 			// https://github.com/vitejs/vite/discussions/16730#discussioncomment-13048825
 			vue: 'vue/dist/vue.esm-bundler.js',
-			'tailwind.config.js': path.resolve(__dirname, 'tailwind.config.js'),
+			'tailwind.config.js': path.resolve(import.meta.dirname, 'tailwind.config.js'),
 		},
 		// A linked frappe-ui brings its own copy of these, and echarts keeps its
 		// renderers, series and registered geographies in module state — so a
@@ -105,24 +99,13 @@ export default defineConfig({
 		outDir: `../insights/public/frontend`,
 		emptyOutDir: true,
 		sourcemap: true,
-		rollupOptions: {
+		rolldownOptions: {
 			input: {
-				main: path.resolve(__dirname, 'index.html'),
-			},
-			output: {
-				manualChunks: {
-					'frappe-ui': ['frappe-ui'],
-				},
+				main: path.resolve(import.meta.dirname, 'index.html'),
 			},
 		},
 	},
 	optimizeDeps: {
-		esbuildOptions: {
-			loader: {
-				'.ts': 'ts',
-				'.tsx': 'tsx',
-			},
-		},
 		include: [
 			'feather-icons',
 			'tailwind.config.js',

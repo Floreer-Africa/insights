@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { ChartContainer } from 'frappe-ui/charts'
-import { computed, inject, ref } from 'vue'
+import { computed, defineAsyncComponent, inject, ref, watch } from 'vue'
 import DataTable from '../../components/DataTable.vue'
 import { findRows } from '../../components/result_pane/find'
+import ResultFooter from '../../components/result_pane/ResultFooter.vue'
+import ResultStatus from '../../components/result_pane/ResultStatus.vue'
+import { usePagination } from '../../composables/usePagination'
 import type { QueryResultColumn, QueryResultRow } from '../../types/query.types'
 import { tableFindKey, type TableCellEvent, type TableChartProps } from '../adapter/table'
 
-// The grid a Table Chart draws instead of a plot. It is a filler like any
+// The grid a Table Chart renders instead of a plot. It is a filler like any
 // other: the title and every state around it are `ChartBody`'s, and the card is
-// whoever drew the chrome, so nothing here draws a surface of its own. It holds the
+// whoever rendered the chrome, so nothing here renders a surface of its own. It holds the
 // table and reports a cell, and everything it puts on the table was decided in
 // `adapter/table.ts`.
 const props = defineProps<TableChartProps>()
@@ -25,13 +28,35 @@ const emit = defineEmits<{
 const findText = inject(tableFindKey, ref(''))
 const matches = computed(() => findRows(props.rows, findText.value))
 
+const pagination = usePagination({
+	pageSize: () => props.page?.size ?? 100,
+	rowCount: () => props.rows.length,
+	totalRowCount: () => props.page?.totalRowCount,
+	currentPage: () => props.page?.current,
+	onPageChange: (page) => props.page?.goTo?.(page),
+	enabled: true,
+})
+
+const ExportDialog = defineAsyncComponent(() => import('../../components/ExportDialog.vue'))
+const showExportDialog = ref(false)
+watch(
+	() => props.download?.downloading,
+	(downloading, wasDownloading) => {
+		if (wasDownloading && !downloading) showExportDialog.value = false
+	},
+)
+
 function onDrilldown(column: QueryResultColumn, row: QueryResultRow) {
 	emit('cellClick', { column, row })
 }
 </script>
 
 <template>
-	<ChartContainer :title="props.title">
+	<ChartContainer :title="props.title" :subtitle="props.subtitle">
+		<template v-if="$slots['title-suffix']" #title-suffix>
+			<slot name="title-suffix" />
+		</template>
+
 		<template v-if="$slots.actions" #actions>
 			<slot name="actions" />
 		</template>
@@ -43,11 +68,11 @@ function onDrilldown(column: QueryResultColumn, row: QueryResultRow) {
 		     `--chart-card-inset`, and a table with no card around it bleeds by
 		     nothing.
 		     The last column drops its own right border once it is flush: the
-		     card's border is already that line, and both drawn is a double rule.
+		     card's border is already that line, and both rendered is a double rule.
 		     A box of its own, not classes on the table: DataTable renders a
 		     fragment — the grid, the empty state and the loading veil are
 		     siblings — so an inherited class would reach none of them.
-		     The card draws the one loading veil, over the whole card: the grid
+		     The card renders the one loading veil, over the whole card: the grid
 		     does not know a run is in flight and never veils itself. -->
 		<div
 			class="relative mt-1 h-full [&_tr>*:last-child]:border-r-0 [margin-inline:calc(var(--chart-card-inset,0px)*-1)] [width:calc(100%_+_2_*_var(--chart-card-inset,0px))]"
@@ -70,7 +95,34 @@ function onDrilldown(column: QueryResultColumn, row: QueryResultRow) {
 				:number-formats="props.numberFormats"
 				:cell-link="props.cellLink"
 				:replace-nulls-with-zeros="true"
-			/>
+				:current-page="props.page?.current"
+				:page-size="props.page?.size"
+			>
+				<template v-if="props.page" #footer>
+					<ResultFooter
+						:pagination="pagination"
+						:on-export="props.download ? () => (showExportDialog = true) : undefined"
+					>
+						<template #left>
+							<ResultStatus
+								:paging="pagination"
+								:loaded-count="props.rows.length"
+								:total-row-count="props.page.totalRowCount"
+								:on-fetch-count="props.page.fetchCount"
+							/>
+						</template>
+					</ResultFooter>
+				</template>
+			</DataTable>
 		</div>
+
+		<ExportDialog
+			v-if="props.download && showExportDialog"
+			v-model="showExportDialog"
+			:downloading="props.download.downloading"
+			:default-filename="props.title"
+			@export="(format, filename) => props.download?.exportResults(format, filename)"
+			@cancel="props.download?.cancelDownload()"
+		/>
 	</ChartContainer>
 </template>

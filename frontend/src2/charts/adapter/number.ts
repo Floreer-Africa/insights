@@ -1,4 +1,5 @@
-import type { NumberCardProps, NumberCardSparkline } from 'frappe-ui/charts'
+import { defineAsyncComponent } from 'vue'
+import type { NumberCardProgress, NumberCardProps, NumberCardSparkline } from 'frappe-ui/charts'
 import { ROW_HEIGHT } from '../../dashboard/grid_placement'
 import { toNumber } from '../../helpers'
 import { granularityOptions } from '../../helpers/constants'
@@ -11,11 +12,12 @@ import type {
 } from '../../types/chart.types'
 import type { Dimension, Measure, QueryResultRow } from '../../types/query.types'
 import { numberFormatOf, printNumber } from '../number_format'
-import { LAST_YEAR, periodOf, previousWindowShift, windowShiftLabel } from '../window'
-import NumberCards from '../components/NumberCards.vue'
+import { LAST_YEAR, periodOf, previousWindowLabel, windowShiftLabel } from '../window'
 import type { ChartAdapterInput, ChartFiller } from './types'
 
-// A Number Chart carries several Measures and v2's card is one reading, so a
+const NumberCards = defineAsyncComponent(() => import('../components/NumberCards.vue'))
+
+// A Number Chart has several Measures and v2's card is one reading, so a
 // reading is a card and the chart is the row of them. Two more things v2 will
 // not do for a caller land here as arithmetic: the gap against the comparison,
 // and the scaling a Measure formatted as a percent asks for.
@@ -33,6 +35,8 @@ export type NumberCardEntry = NumberCardProps & {
 	missing?: boolean
 	/** The card's height in px, as a cell of `numberCardRows` rows gives it. */
 	height: number
+	/** The reading's info, behind a mark beside its name. */
+	info?: string
 }
 
 export type NumberCardClickEvent = { column: string }
@@ -43,17 +47,17 @@ export function adaptNumberChart(input: ChartAdapterInput): ChartFiller | undefi
 
 	// The config names every reading, so the cards are built before a result and
 	// built when none arrives: a card with no row prints a dash, and the states
-	// the other types draw on their chrome are drawn inside them.
+	// the other types render on their chrome are rendered inside them.
 	const rows = input.result.rows || []
 	// Every reading is the newest one, so the newest row is the row behind every
 	// card. Which row a comparison reads is the server's answer, not a count
 	// back from here — see `comparisonNumber`.
 	const current = rows[rows.length - 1]
 
-	// A dashboard cell names the one reading it draws. A surface that names none
+	// A dashboard cell names the one reading it shows. A surface that names none
 	// — the workbook editor — previews them all.
-	const drawn = input.reading ? [input.reading] : numberReadings(config)
-	const cards = drawn.map((reading) =>
+	const shown = input.reading ? [input.reading] : numberReadings(config)
+	const cards = shown.map((reading) =>
 		cardFor(config, rows, reading, input.comparisonRows, input.sparklineResult?.rows),
 	)
 
@@ -63,7 +67,7 @@ export function adaptNumberChart(input: ChartAdapterInput): ChartFiller | undefi
 	const drillable = (input.drillable ?? true) && Boolean(current)
 
 	// A surface that names no reading gets the cards at the size a cell gives
-	// them, so the preview is what the dashboard draws and not a guess at it.
+	// them, so the preview is what the dashboard shows and not a guess at it.
 	const filler: ChartFiller = {
 		component: NumberCards,
 		props: { cards, preview: !input.reading, drillable },
@@ -97,7 +101,7 @@ export function numberReadings(config?: NumberChartConfig): string[] {
  * entries included. `-1` when the config states no such reading.
  *
  * Naming none is naming the first: a cell written before a cell could name one
- * draws what it has always drawn.
+ * shows what it has always shown.
  */
 function readingIndex(config: NumberChartConfig, reading?: string): number {
 	const columns = config.number_columns || []
@@ -154,12 +158,15 @@ function readingOf(
 		value: scale(latest),
 	}
 	if (options.color) card.color = options.color
+	if (options.info) card.info = options.info
 	if (format.prefix) card.prefix = format.prefix
 	if (format.suffix) card.suffix = format.suffix
-	// The card prints the prefix and suffix around what `format` returns, and the
-	// value is already scaled, so the formatter prints digits alone.
+	// The card prints the prefixes and suffixes around what `format` and
+	// `deltaFormat` return, and the value is already scaled, so the formatter
+	// prints digits alone.
 	const digits = { ...format, prefix: undefined, suffix: undefined, scale: 1 }
 	card.format = (value) => printNumber(value, digits)
+	card.deltaFormat = card.format
 
 	const { target, comparison } = options
 
@@ -168,12 +175,23 @@ function readingOf(
 	const aim = scale(targetNumber(target, rows) ?? null)
 	if (aim !== null) card.target = aim
 
+	if (options.progress && canDrawProgress(target, measure)) {
+		const value = progressOf(latest, targetNumber(target, rows))
+		if (value !== undefined) {
+			const progress: NumberCardProgress = { value }
+			// A reading colored to stand for a series is read against that color.
+			const color = options.progress_color || options.color
+			if (color) progress.color = color
+			card.progress = progress
+		}
+	}
+
 	if (comparison) {
 		const against = comparisonNumber(comparison, rows, readings, comparisonRows)
 		if (against !== undefined) {
 			const show = comparison.show ?? 'change'
 			if (show === 'delta') {
-				// A gap in the value's own units carries the value's own units, so
+				// A gap in the value's own units keeps the value's own units, so
 				// the percent Measure's scaling applies to it too.
 				card.delta = latest === null || against === null ? null : scale(latest - against)
 				if (format.prefix) card.deltaPrefix = format.prefix
@@ -200,7 +218,7 @@ function readingOf(
 		// A grain card is one row per period, so its own readings are the trend.
 		// A span card is one row per period — the reading and what it is held
 		// against — which is never a trend, so it waits for the run the server
-		// makes for it. Falling back to the rows there draws a two-point line from
+		// makes for it. Falling back to the rows there plots a two-point line from
 		// the reading and its comparison, which reads as a trend.
 		const grouped = periodOf(config)
 		const data = series
@@ -219,15 +237,41 @@ function readingOf(
 	return card
 }
 
+/**
+ * How far a reading that can draw a bar has come, in percent. Against its target
+ * when it names one, else it is a percent, whose fraction is out of 100%.
+ */
+function progressOf(latest: number | null, aim: number | null | undefined): number | undefined {
+	if (latest === null) return undefined
+	if (aim !== undefined) return aim ? (latest / aim) * 100 : undefined
+	return latest * 100
+}
+
+/**
+ * Whether the target names a number: a constant, or a Measure with its column
+ * picked. Picking "Measure" as the source stores one with no column until the
+ * author picks it.
+ */
+export function namesTarget(target: NumberTarget | undefined): target is NumberTarget {
+	return typeof target?.value === 'number' || Boolean(target?.measure?.measure_name)
+}
+
+/** Whether the reading has something for a progress bar to fill towards. */
+export function canDrawProgress(
+	target: NumberTarget | undefined,
+	measure: Measure | undefined,
+): boolean {
+	return namesTarget(target) || measure?.format === 'percent'
+}
+
 /** The number the reading is aimed at, or `undefined` when nothing names one. */
 function targetNumber(
 	target: NumberTarget | undefined,
 	rows: QueryResultRow[],
 ): number | null | undefined {
-	if (!target) return undefined
+	if (!namesTarget(target)) return undefined
 	if (typeof target.value === 'number') return target.value
-	const column = target.measure?.measure_name
-	if (!column) return undefined
+	const column = target.measure!.measure_name
 	// Read off the same row the reading came from: a target is the target for the
 	// period on the card, not for the whole series.
 	return toNumber(rows[rows.length - 1]?.[column])
@@ -295,16 +339,15 @@ export function defaultComparisonLabel(
 
 	// Worded by the period the config holds, not by the row the server named: the
 	// form prints this as the caption's placeholder before a card has ever run.
-	// A shifted span is named by the shift, and a grain's row before the last
-	// one by the grain it was grouped by.
+	// A span is named by the stretch before it, and a grain's previous period
+	// by the grain it was grouped by.
 	const period = periodOf(config)
 	if (comparison.source === 'last year') {
 		return period?.span ? windowShiftLabel(LAST_YEAR) : undefined
 	}
 	if (comparison.source !== 'previous') return undefined
 
-	const shift = previousWindowShift(period?.span)
-	return shift ? windowShiftLabel(shift) : previousLabel(config)
+	return previousWindowLabel(period?.span) || previousLabel(config)
 }
 
 /**
@@ -320,46 +363,56 @@ function previousLabel(config: NumberChartConfig): string | undefined {
 }
 
 /**
- * The card, measured from the CSS that draws it — every number below is a class
+ * The card, measured from the CSS that renders it — every number below is a class
  * on frappe-ui's `NumberCard.vue` or `ChartCard`, resolved against the type
  * scale, and nothing here is an estimate.
  */
 const CARD = {
 	/** A dashboard cell's `p-2`, top and bottom. */
 	cellPadding: 2 * 8,
-	/** ChartCard's `py-3` and its 1px border, top and bottom. */
-	chrome: 2 * (12 + 1),
+	/**
+	 * ChartCard's 1px border and the `py-2` `NumberReading` gives it, top and
+	 * bottom. Not ChartCard's own `py-3`: sized for that, a card lands up to a
+	 * row taller than its content.
+	 */
+	chrome: 2 * (8 + 1),
 	/** `gap-1.5` between the card's blocks. */
 	gap: 6,
-	/** The title: `text-sm`, 13px at a line height of 1.15. */
-	title: 13 * 1.15,
-	/** The reading: `text-3xl-semibold`, 20px at 1.15. */
-	value: 20 * 1.15,
-	/** The delta row: a `size-4` arrow, which stands taller than its own text. */
-	delta: 16,
-	/** `pb-10`, the band the sparkline is drawn into. */
+	/** The title: `text-sm`, 13px at a line height of 1.35. */
+	title: 13 * 1.35,
+	/** The reading: `text-3xl-semibold`, 20px at 1.35. */
+	value: 20 * 1.35,
+	/** The delta row: `text-sm`, whose line stands taller than its `size-4` arrow. */
+	delta: 13 * 1.35,
+	/** `pb-10`, the band the sparkline is plotted into. */
 	sparkline: 40,
+	/** The progress bar: `h-1` under a `gap-1.5` and its own `mt-0.5`. */
+	progress: 6 + 2 + 4,
 }
 
 /**
  * The rows one reading of a Number Chart takes as a dashboard cell.
  *
  * A card's height is what its blocks add up to, so the author sets the width and
- * the height follows the config. There are three of them: a title and a reading,
- * a delta row under them when the reading is compared with something, and the
- * sparkline band under that.
+ * the height follows the config: a title and a reading, a delta row under them
+ * when the reading is compared with something, the progress bar under that, and
+ * the sparkline band last.
  *
- * A cell that names nothing draws the first reading. One naming a reading the
+ * A cell that names nothing shows the first reading. One naming a reading the
  * chart dropped keeps the height the chart's own settings give it, so the cell
  * does not move under the author while they decide what to do about it.
  */
 export function numberCardRows(config: NumberChartConfig, reading?: string): number {
-	const options = config.number_column_options?.[readingIndex(config, reading)] || {}
+	const index = readingIndex(config, reading)
+	const options = config.number_column_options?.[index] || {}
 	const comparison = options.comparison
 	const sparkline = Boolean(config.sparkline && config.date_column?.column_name)
+	const progress =
+		options.progress && canDrawProgress(options.target, config.number_columns?.[index])
 
 	let height = CARD.cellPadding + CARD.chrome + CARD.title + CARD.gap + CARD.value
 	if (comparison || sparkline) height += CARD.gap + CARD.delta
+	if (progress) height += CARD.progress
 	if (sparkline) height += CARD.sparkline
 
 	return Math.ceil(height / ROW_HEIGHT)

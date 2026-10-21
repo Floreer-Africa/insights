@@ -1,17 +1,17 @@
 import { HeatmapChart } from 'frappe-ui/charts'
 import { describe, expect, it } from 'vitest'
-import { heatmapChart, type HeatmapChartSpec } from './fixtures'
+import { heatmapChart, loadedComponent, type HeatmapChartSpec } from './fixtures'
 import { adaptChart } from './index'
 
 function adapt(spec: HeatmapChartSpec) {
 	const filler = adaptChart(heatmapChart(spec))
-	if (!filler) throw new Error('the adapter drew nothing for this Chart')
+	if (!filler) throw new Error('the adapter rendered nothing for this Chart')
 	return filler
 }
 
 describe('a heatmap', () => {
 	// @feature charts.type-heatmap
-	it('names the two columns the grid is cut by, and what colors a cell', () => {
+	it('names the two columns the grid is cut by, and what colors a cell', async () => {
 		const input = heatmapChart({
 			title: 'Orders by day and hour',
 			x: 'day',
@@ -20,7 +20,7 @@ describe('a heatmap', () => {
 		})
 		const { component, props } = adaptChart(input)!
 
-		expect(component).toBe(HeatmapChart)
+		expect(await loadedComponent(component)).toBe(HeatmapChart)
 		expect(props.title).toBe('Orders by day and hour')
 		expect(props.x).toBe('day')
 		expect(props.y).toBe('hour')
@@ -76,7 +76,7 @@ describe('a heatmap', () => {
 	})
 
 	// @feature charts.type-heatmap
-	it('draws nothing until the Chart names all three columns', () => {
+	it('renders nothing until the Chart names all three columns', () => {
 		expect(adaptChart(heatmapChart({ x: '', y: 'hour', measure: 'orders' }))).toBeUndefined()
 		expect(adaptChart(heatmapChart({ x: 'day', y: '', measure: 'orders' }))).toBeUndefined()
 		expect(adaptChart(heatmapChart({ x: 'day', y: 'hour', measure: '' }))).toBeUndefined()
@@ -85,7 +85,7 @@ describe('a heatmap', () => {
 
 describe('drilling into a cell', () => {
 	// @feature charts.drill-segment
-	it('names the value column and the row the cell was drawn from', () => {
+	it('names the value column and the row the cell was plotted from', () => {
 		const input = heatmapChart({ x: 'day', y: 'hour', measure: 'orders' })
 		const row = input.result.rows[1]
 

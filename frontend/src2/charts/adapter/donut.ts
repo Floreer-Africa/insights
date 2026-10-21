@@ -1,8 +1,10 @@
-import { DonutChart } from 'frappe-ui/charts'
+import { defineAsyncComponent } from 'vue'
 import type { DonutChartProps, DonutSliceEvent } from 'frappe-ui/charts'
 import type { DonutChartConfig } from '../../types/chart.types'
 import { numberFormatter } from '../number_format'
 import type { ChartAdapterInput, ChartFiller } from './types'
+
+const DonutChart = defineAsyncComponent(() => import('./lazy_charts').then((m) => m.DonutChart))
 
 // The server groups a donut by its label column and orders the segments biggest
 // first, so the result is already one row per segment, in the order the ring is
@@ -16,12 +18,13 @@ export function adaptDonutChart(input: ChartAdapterInput): ChartFiller | undefin
 
 	const props: DonutChartProps = {
 		title: input.title,
+		subtitle: input.description,
 		data: input.result.rows,
 		category,
 		value,
 		format: numberFormatter(config, config.value_column, input.result.rows),
 	}
-	// The tail is collapsed once, by the ring that draws it. An older release
+	// The tail is collapsed once, by the ring that plots it. An older release
 	// stored a `legend_position`, which is dropped: where the legend sits is the
 	// library's to decide, and nothing states it any more.
 	if (config.max_slices) props.maxSlices = config.max_slices

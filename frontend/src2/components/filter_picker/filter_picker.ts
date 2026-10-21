@@ -1,12 +1,12 @@
 // The vocabulary the filter picker speaks: the kinds a column falls in, the
-// operator table each kind offers, the spans a date filter is written in, the
+// operator table each kind allows, the spans a date filter is written in, the
 // one date formatter every stage prints through, and the parts of the line an
 // overview row prints.
 
+import type { Dayjs } from 'dayjs'
 import type { Component } from 'vue'
 import { FIELDTYPES, type FilterType } from '../../helpers/constants'
 import dayjs from '../../helpers/dayjs'
-import { endOfPeriod, shiftPeriods, startOfPeriod } from '../../helpers/calendar'
 import {
 	buildSpan,
 	parseSpan,
@@ -128,7 +128,7 @@ export function operatorOf(kind: FilterKind, operator: FilterOperator): Operator
 	return operators()[kind].find((op) => op.operator === operator)
 }
 
-function defaultOperator(kind: FilterKind): OperatorDef {
+export function defaultOperator(kind: FilterKind): OperatorDef {
 	const operator: FilterOperator = kind === 'text' ? 'in' : kind === 'number' ? '>=' : 'between'
 	return operatorOf(kind, operator) as OperatorDef
 }
@@ -181,10 +181,10 @@ export type ListItem = {
 }
 
 /**
- * The numbers a `>=`-style stage offers, cut from the column's own range.
+ * The numbers a `>=`-style stage lists, cut from the column's own range.
  *
  * Quarters of it, rounded to something a reader would type. A fixed list of
- * round numbers offered 1,000 for a column of percentages and nothing at all for
+ * round numbers listed 1,000 for a column of percentages and nothing at all for
  * a column of revenues — presets have to come from the column or not exist.
  */
 export function numberQuickValues(range?: [number, number]): number[] {
@@ -196,7 +196,7 @@ export function numberQuickValues(range?: [number, number]): number[] {
 	return [...new Set(cuts)].filter((value) => value > low && value < high)
 }
 
-/** The ranges a `between` stage offers: the column's own, in three parts. */
+/** The ranges a `between` stage lists: the column's own, in three parts. */
 export function numberPairValues(range?: [number, number]): Array<[number, number]> {
 	if (!range) return []
 	const cuts = numberQuickValues(range)
@@ -300,7 +300,7 @@ function timespanOf(value: FilterValue): Timespan | undefined {
 	return undefined
 }
 
-/** The directions the relative stage offers, which are the grammar's own. */
+/** The directions the relative stage lists, which are the grammar's own. */
 export type SpanDirection = Extract<SpanShape, 'last' | 'next' | 'current'>
 
 export type RelativeForm = {
@@ -311,7 +311,7 @@ export type RelativeForm = {
 }
 
 /**
- * The presets the `within` stage offers. Every span here is one
+ * The presets the `within` stage lists. Every span here is one
  * `charts/window.ts` writes and the server's `get_window` parses — a "last N"
  * span covers whole periods behind today, so "Last 7 days" ends yesterday.
  */
@@ -336,45 +336,6 @@ export function spanOf(form: RelativeForm): string {
 	return buildSpan({ ...form, shape: form.direction })
 }
 
-/**
- * `get_window` in dayjs, for the range the calendar and the notes print.
- *
- * The periods are the site's own, its week start and its fiscal year, because
- * this range is a preview of the rows the server will return, and the server
- * counts by those.
- */
-export function resolveSpan(span: string, anchor?: string): [string, string] {
-	const today = anchor ? dayjs(anchor) : dayjs()
-
-	const form = parseSpan(span)
-	if (!form) return [span, span]
-
-	const currentStart = startOfPeriod(today, form.unit)
-
-	if (form.shape === 'to date') {
-		return [currentStart.format(DATE_FORMAT), today.format(DATE_FORMAT)]
-	}
-
-	if (form.shape === 'current') {
-		return [currentStart.format(DATE_FORMAT), endOfPeriod(today, form.unit).format(DATE_FORMAT)]
-	}
-
-	if (form.shape === 'last') {
-		// N whole periods, the last of them ending the day before the current
-		// one starts, unless the current one is asked for too.
-		const from = shiftPeriods(currentStart, form.unit, -form.count)
-		const to = form.includeCurrent
-			? endOfPeriod(today, form.unit)
-			: currentStart.subtract(1, 'day')
-		return [from.format(DATE_FORMAT), to.format(DATE_FORMAT)]
-	}
-
-	const nextStart = shiftPeriods(currentStart, form.unit, 1)
-	const from = form.includeCurrent ? currentStart : nextStart
-	const to = shiftPeriods(nextStart, form.unit, form.count).subtract(1, 'day')
-	return [from.format(DATE_FORMAT), to.format(DATE_FORMAT)]
-}
-
 /** A span in the picker's words: `Today`, `Last 7 days`, `Next 2 weeks`. */
 export function spanLabel(span: string): string {
 	const preset = datePresets().find((p) => p.span === span)
@@ -388,14 +349,6 @@ export function spanLabel(span: string): string {
 	const phrase = unitWords(form.unit, form.count)
 	const label = form.shape === 'last' ? __('Last {0}', phrase) : __('Next {0}', phrase)
 	return form.includeCurrent ? `${label} ${__('(include current)')}` : label
-}
-
-/** A span as the days it covers, through the one date formatter. */
-export function spanDates(value: FilterValue, anchor?: string): string {
-	const timespan = timespanOf(value)
-	if (!timespan) return ''
-	const [from, to] = resolveSpan(timespan.span, anchor || timespan.anchor)
-	return formatDate(from, to)
 }
 
 /** The directions the `Relative…` row opens onto. */
@@ -415,7 +368,7 @@ export function unitRows(form: RelativeForm): Array<{ label: string; span: strin
 	}))
 }
 
-/** The one row the `within` stage carries past its presets. */
+/** The one row the `within` stage lists past its presets. */
 export const relativeRow = translatedTable<{ key: string; label: string }>(() => ({
 	key: 'relative',
 	label: __('Relative…'),
@@ -473,6 +426,14 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/
 
 function isDay(text: string): boolean {
 	return DAY.test(text) && dayjs(text).isValid()
+}
+
+/** `date` moved `count` periods of `unit`. */
+function shiftPeriods(date: Dayjs, unit: SpanUnit, count: number): Dayjs {
+	if (unit === 'quarter') return date.add(count * 3, 'month')
+	// a fiscal year is twelve months long wherever it starts, so it moves by the year
+	if (unit === 'fiscal year') return date.add(count, 'year')
+	return date.add(count, unit as any)
 }
 
 /** What a typed date phrase means, where the value stage takes one. */
@@ -662,7 +623,7 @@ export function pathOf(filter: Filter): Path {
 	if (operator === 'within') {
 		const span = timespanOf(value)?.span || ''
 		const parsed = isPreset(span) ? undefined : parseSpan(span)
-		// The relative row draws a direction, so a `to date` span is not one of
+		// The relative row shows a direction, so a `to date` span is not one of
 		// its forms: the overview prints it through `spanLabel` instead.
 		const relative: RelativeForm | undefined =
 			parsed && parsed.shape !== 'to date'
@@ -685,6 +646,19 @@ export function pathOf(filter: Filter): Path {
 	}
 	const op = operatorOf('date', operator) || base.op
 	return { ...base, op, text: String(value ?? '') }
+}
+
+/** The key of the row a reopened rule reads as, on the stage in front of the reader. */
+export function selectedRowKey(filter: Filter, stage: Stage): string | undefined {
+	const path = pathOf(filter)
+	if (stage === 'operator') return path.op.operator
+	if (filter.operator !== 'within') return undefined
+	if (stage === 'unit') return path.relative && `span:${spanOf(path.relative)}`
+
+	// an anchored span is a shifted period, not the preset its span names
+	const timespan = timespanOf(filter.value)
+	if (stage !== 'value' || !timespan || timespan.anchor || !isPreset(timespan.span)) return
+	return `span:${timespan.span}`
 }
 
 export function toFilterArgs(filter: Filter): FilterArgs {

@@ -1,17 +1,17 @@
 import { SankeyChart } from 'frappe-ui/charts'
 import { describe, expect, it } from 'vitest'
-import { sankeyChart, type SankeyChartSpec } from './fixtures'
+import { sankeyChart, loadedComponent, type SankeyChartSpec } from './fixtures'
 import { adaptChart } from './index'
 
 function adapt(spec: SankeyChartSpec) {
 	const filler = adaptChart(sankeyChart(spec))
-	if (!filler) throw new Error('the adapter drew nothing for this Chart')
+	if (!filler) throw new Error('the adapter rendered nothing for this Chart')
 	return filler
 }
 
 describe('a sankey', () => {
 	// @feature charts.type-sankey
-	it('names the node a flow leaves, the one it arrives at, and what runs along it', () => {
+	it('names the node a flow leaves, the one it arrives at, and what runs along it', async () => {
 		const input = sankeyChart({
 			title: 'Traffic to category',
 			source: 'traffic_source',
@@ -20,7 +20,7 @@ describe('a sankey', () => {
 		})
 		const { component, props } = adaptChart(input)!
 
-		expect(component).toBe(SankeyChart)
+		expect(await loadedComponent(component)).toBe(SankeyChart)
 		expect(props.title).toBe('Traffic to category')
 		expect(props.source).toBe('traffic_source')
 		expect(props.target).toBe('category')
@@ -43,7 +43,7 @@ describe('a sankey', () => {
 	})
 
 	// @feature charts.type-sankey
-	it('draws nothing until the Chart names all three columns', () => {
+	it('renders nothing until the Chart names all three columns', () => {
 		expect(
 			adaptChart(sankeyChart({ source: '', target: 'category', measure: 'revenue' })),
 		).toBeUndefined()
@@ -58,7 +58,7 @@ describe('a sankey', () => {
 
 describe('drilling into a flow', () => {
 	// @feature charts.drill-segment
-	it('names the value column and the row the band was drawn from', () => {
+	it('names the value column and the row the band was plotted from', () => {
 		const input = sankeyChart({
 			source: 'traffic_source',
 			target: 'category',
