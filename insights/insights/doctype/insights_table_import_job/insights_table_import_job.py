@@ -17,7 +17,7 @@ from frappe.utils.password import get_decrypted_password
 from frappe.utils.safe_exec import safe_exec
 
 from insights.insights.doctype.insights_data_source_v3.data_warehouse import WarehouseTableWriter
-from insights.insights.doctype.insights_data_source_v3.ibis_utils import SafePandasDataFrame
+from insights.insights.doctype.insights_data_source_v3.sandbox import script_globals
 from insights.utils import InsightsDataSourcev3
 
 parse_cron = lru_cache(croniter)
@@ -49,6 +49,9 @@ class InsightsTableImportJob(Document):
 
     def validate(self):
         """Validate the job document."""
+        # a stored name stays: the job's rows and cursor live in the table it names
+        if self.has_value_changed("table_name"):
+            self.table_name = frappe.scrub(self.table_name)
         self.validate_cron_expression()
 
     def validate_cron_expression(self):
@@ -58,9 +61,6 @@ class InsightsTableImportJob(Document):
                 parse_cron(self.schedule)
             except Exception as e:
                 frappe.throw(f"Invalid cron expression: {e!s}")
-
-    def on_update(self):
-        self.table_name = frappe.scrub(self.table_name)
 
     def is_event_due(self, current_time=None):
         if not self.schedule:
@@ -77,12 +77,12 @@ class InsightsTableImportJob(Document):
         next_execution = parse_cron(self.schedule).get_next(datetime, start_time=last_run)
         return next_execution
 
-    @frappe.whitelist()
+    @frappe.whitelist(methods=["POST"])
     def enqueue(self):
         enqueue_table_import_job(self.name)
         frappe.msgprint(f"Job '{self.title}' has been queued for execution.")
 
-    @frappe.whitelist()
+    @frappe.whitelist(methods=["POST"])
     def bulk_enqueue(self, run_count: int):
         """Queue the job to run multiple times sequentially."""
         run_count = int(run_count)
@@ -126,6 +126,8 @@ def bulk_execute_runs(import_job_name: str, run_count: int):
         frappe.publish_realtime(
             "bulk_enqueue_progress",
             {"job": import_job_name, "current": i + 1, "total": run_count},
+            doctype="Insights Table Import Job",
+            docname=import_job_name,
         )
         execute_table_import_job(import_job_name)
 
@@ -171,7 +173,6 @@ class TableImportJobRun:
             }
         )
         self.log.insert(ignore_permissions=True)
-        frappe.db.commit()
 
         # Create the table writer for writing data
         self._table_writer = TableWriter(self)
@@ -199,23 +200,13 @@ class TableImportJobRun:
             "state": self.job_state,
             "secrets": JobSecrets(self.job),
             "log": self._log,
-            "pandas": frappe._dict(
-                {
-                    "DataFrame": SafePandasDataFrame,
-                }
-            ),
         }
 
         _locals = {}
 
         self._log("Executing script...")
 
-        safe_exec(
-            code,
-            _globals=_globals,
-            _locals=_locals,
-            restrict_commit_rollback=True,
-        )
+        safe_exec(code, _globals={**script_globals(), **_globals}, _locals=_locals)  # nosemgrep
 
         self._log("Script executed successfully")
 
@@ -427,7 +418,7 @@ class TableWriter:
 
 
 class JobState:
-    """What the script carries between runs — usually the cursor its next run starts from.
+    """What the script keeps between runs — usually the cursor its next run starts from.
 
     Buffered in memory, written by `save()` on the success path only. A `db_set`
     here lands inside the open transaction and the next log line commits it, so

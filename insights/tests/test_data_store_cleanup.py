@@ -26,7 +26,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
         frappe.db.delete("Insights Query Execution Log")
         frappe.db.delete("Insights Query Reference")
         frappe.db.delete("Insights Table Import Log")
-        self.cutoff = add_days(now_datetime(), -data_warehouse.UNUSED_TABLE_DAYS)
+        self.set_retention(90)
 
     # helpers
 
@@ -116,18 +116,37 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
         ref.flags.ignore_links = True
         ref.insert(ignore_permissions=True)
 
+    def set_retention(self, days):
+        """Set the execution log's row in Log Settings; `None` deletes the row, as before Log Settings is first saved after migrate."""
+        doctype = "Insights Query Execution Log"
+        log_settings = frappe.get_doc("Log Settings")
+        original = next((row.days for row in log_settings.logs_to_clear if row.ref_doctype == doctype), None)
+        self.addCleanup(self.write_retention, original)
+        self.write_retention(days)
+
+    def write_retention(self, days):
+        doctype = "Insights Query Execution Log"
+        if days is None:
+            frappe.db.delete("Logs To Clear", {"parent": "Log Settings", "ref_doctype": doctype})
+            return
+        log_settings = frappe.get_doc("Log Settings")
+        log_settings.logs_to_clear = [row for row in log_settings.logs_to_clear if row.ref_doctype != doctype]
+        log_settings.register_doctype(doctype, days)
+        log_settings.save(ignore_permissions=True)
+
     def is_stored(self, table_name):
         return frappe.db.get_value("Insights Table v3", get_table_name(DATA_SOURCE, table_name), "stored")
 
     # prune
 
+    # @feature data-store.cleanup-prunes-stale
     def test_prunes_table_whose_queries_are_stale(self):
         table = self.create_table("tabCleanupStale")
         self.log_import("tabCleanupStale", days_ago=90)
         self.reference_table("q_stale", "tabCleanupStale")
         self.log_execution("q_stale", days_ago=60)
 
-        pruned = prune_unused_tables(self.cutoff)
+        pruned = prune_unused_tables()
 
         self.assertIn(table.name, pruned)
         self.assertFalse(self.is_stored("tabCleanupStale"))
@@ -136,6 +155,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             "pruned tables must forget where the last sync stopped",
         )
 
+    # @feature data-store.cleanup-prunes-stale
     def test_keeps_recently_used_table(self):
         self.create_table("tabCleanupUsed")
         self.log_import("tabCleanupUsed", days_ago=90)
@@ -143,10 +163,11 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
         self.log_execution("q_used", days_ago=60)
         self.log_execution("q_used", days_ago=2)
 
-        prune_unused_tables(self.cutoff)
+        prune_unused_tables()
 
         self.assertTrue(self.is_stored("tabCleanupUsed"))
 
+    # @feature data-store.cleanup-prunes-stale
     def test_keeps_table_used_through_a_nested_query(self):
         self.create_table("tabCleanupNested")
         self.log_import("tabCleanupNested", days_ago=90)
@@ -154,37 +175,47 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
         self.reference_table("q_child", "tabCleanupNested")
         self.reference_query("q_parent", "q_child")
         self.log_execution("q_parent", days_ago=2)
-        # the site's execution log must reach past the cutoff for pruning to run at all
-        self.log_execution("q_other", days_ago=90)
 
-        prune_unused_tables(self.cutoff)
+        prune_unused_tables()
 
         self.assertTrue(self.is_stored("tabCleanupNested"))
 
+    # @feature data-store.cleanup-prunes-stale
     def test_keeps_freshly_imported_table_nobody_has_queried(self):
         self.create_table("tabCleanupFresh")
         self.log_import("tabCleanupFresh", days_ago=3)
-        self.log_execution("q_other", days_ago=90)
 
-        prune_unused_tables(self.cutoff)
+        prune_unused_tables()
 
         self.assertTrue(self.is_stored("tabCleanupFresh"))
 
+    # @feature data-store.cleanup-prunes-stale
     def test_keeps_incremental_table(self):
         self.create_table("tabCleanupIncremental", sync_mode="Incremental")
         self.log_import("tabCleanupIncremental", days_ago=90)
-        self.log_execution("q_other", days_ago=90)
 
-        prune_unused_tables(self.cutoff)
+        prune_unused_tables()
 
         self.assertTrue(self.is_stored("tabCleanupIncremental"))
 
-    def test_skips_pruning_when_execution_log_was_trimmed(self):
+    # @feature data-store.cleanup-prunes-stale
+    def test_prunes_unused_table_when_the_retention_emptied_the_log(self):
+        for days in (90, data_warehouse.UNUSED_TABLE_DAYS, None):
+            with self.subTest(retention=days):
+                self.set_retention(days)
+                table = self.create_table("tabCleanupIdle")
+                self.log_import("tabCleanupIdle", days_ago=60)
+
+                self.assertIn(table.name, prune_unused_tables())
+
+    # @feature data-store.cleanup-prunes-stale
+    def test_skips_pruning_when_retention_is_shorter_than_the_unused_window(self):
+        self.set_retention(10)
         self.create_table("tabCleanupUnknown")
         self.log_import("tabCleanupUnknown", days_ago=90)
         self.log_execution("q_recent", days_ago=1)
 
-        pruned = prune_unused_tables(self.cutoff)
+        pruned = prune_unused_tables()
 
         self.assertEqual(pruned, [])
         self.assertTrue(self.is_stored("tabCleanupUnknown"))
@@ -223,6 +254,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             ).fetchall()
         )
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_stored_tables_and_drops_empty_orphans(self):
         self.create_table("tabCleanupKept")
         schema = data_warehouse.get_warehouse_schema_name(DATA_SOURCE)
@@ -247,6 +279,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             schemas = {row[0] for row in db.raw_sql("select schema_name from duckdb_schemas()").fetchall()}
             self.assertNotIn("gone_data_source", schemas)
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_an_unexplained_table_holding_rows(self):
         """The bug behind frappe/insights#1295: a writer that never set `stored`."""
         schema = data_warehouse.get_warehouse_schema_name(DATA_SOURCE)
@@ -263,10 +296,11 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertIn((schema, "tabcleanuporphan"), self.warehouse_tables(db))
 
         self.assertTrue(
-            frappe.db.exists("Error Log", {"method": "Data store cleanup kept an unexplained table"}),
+            frappe.get_all("Error Log", filters={"method": "Data store cleanup kept an unexplained table"}),
             "a table the sweep refuses to drop must leave a record that outlives the file log",
         )
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_drops_a_pruned_table_holding_rows(self):
         """A pruned table is not unexplained: its doc says a re-import rebuilds it."""
         self.create_table("tabCleanupPruned", stored=0)
@@ -282,6 +316,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(dropped, [f"{schema}.tabcleanuppruned"])
             self.assertEqual(kept, [])
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_a_pruned_incremental_table_holding_rows(self):
         """An incremental re-import restarts from `sync_from`, so it rebuilds nothing."""
         self.create_table("tabCleanupPrunedInc", stored=0, sync_mode="Incremental")
@@ -297,6 +332,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(dropped, [])
             self.assertEqual(kept, [f"{schema}.tabcleanupprunedinc"])
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_drops_a_legacy_flat_table_its_successor_replaced(self):
         """`main."site_db.tabX"` is the pre-rename copy of `site_db.tabx`."""
         self.create_table("tabCleanupFlat")
@@ -313,6 +349,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(dropped, [f"main.{schema}.tabCleanupFlat"])
             self.assertEqual(kept, [])
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_a_legacy_flat_table_with_no_successor(self):
         """Nothing replaced it, so its rows may be the only copy."""
         schema = data_warehouse.get_warehouse_schema_name(DATA_SOURCE)
@@ -326,6 +363,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(dropped, [])
             self.assertEqual(kept, [f"main.{schema}.tabCleanupLost"])
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_a_flat_table_it_cannot_attribute(self):
         """No data source claims this prefix, so the split cannot name a successor."""
         with self.warehouse_file() as (db, _):
@@ -337,6 +375,7 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(dropped, [])
             self.assertEqual(kept, ["main.tabCleanupUnowned"])
 
+    # @feature data-store.cleanup-keeps-unexplained
     def test_orphan_sweep_keeps_the_table_an_import_job_writes(self):
         # A job writes to the source's `schema` field, not to the derived name.
         frappe.db.set_value("Insights Data Source v3", DATA_SOURCE, "schema", "job_schema")
@@ -353,14 +392,59 @@ class TestDataStoreCleanup(InsightsIntegrationTestCase):
             self.assertEqual(kept, [], "a known import job table is explained, so it raises no alarm")
             self.assertIn(("job_schema", "cleanup_job_table"), self.warehouse_tables(db))
 
+    # @feature data-store.cleanup-keeps-unexplained
+    def test_orphan_sweep_drops_a_leftover_table_a_live_table_holds(self):
+        """A dead import left `ibis_duckdb_table_*`; the live table has been re-imported since."""
+        self.create_table("tabCleanupLive")
+        schema = data_warehouse.get_warehouse_schema_name(DATA_SOURCE)
+        leftover = "ibis_duckdb_table_cleanuplive"
+
+        with self.warehouse_file() as (db, _):
+            db.raw_sql(f'create schema "{schema}"')
+            db.raw_sql(f'create table "{schema}".tabcleanuplive as select i as a, i as b from range(3) t(i)')
+            db.raw_sql(f'create table "{schema}".{leftover} as select i as b, i as a from range(3) t(i)')
+
+            with self.patched_write_connection(db):
+                dropped, kept = drop_orphan_warehouse_tables()
+
+            self.assertEqual(dropped, [f"{schema}.{leftover}"])
+            self.assertEqual(kept, [])
+            self.assertEqual(self.warehouse_tables(db), {(schema, "tabcleanuplive")})
+
+    # @feature data-store.cleanup-keeps-unexplained
+    def test_orphan_sweep_keeps_a_leftover_table_no_live_table_holds(self):
+        """More rows than the live table, or other columns: the leftover may hold rows nothing else does."""
+        self.create_table("tabCleanupLive")
+        schema = data_warehouse.get_warehouse_schema_name(DATA_SOURCE)
+
+        with self.warehouse_file() as (db, _):
+            db.raw_sql(f'create schema "{schema}"')
+            db.raw_sql(f'create table "{schema}".tabcleanuplive as select i as a, i as b from range(3) t(i)')
+            db.raw_sql(
+                f'create table "{schema}".ibis_duckdb_table_more as select i as a, i as b from range(4) t(i)'
+            )
+            db.raw_sql(
+                f'create table "{schema}".ibis_duckdb_table_other as select i as a, i as c from range(2) t(i)'
+            )
+
+            with self.patched_write_connection(db):
+                dropped, kept = drop_orphan_warehouse_tables()
+
+            self.assertEqual(dropped, [])
+            self.assertEqual(
+                sorted(kept), [f"{schema}.ibis_duckdb_table_more", f"{schema}.ibis_duckdb_table_other"]
+            )
+
     # compaction
 
+    # @feature data-store.compaction
     def test_compaction_skipped_for_small_files(self):
         with self.warehouse_file() as (db, path):
             db.raw_sql("create table t as select 1 as a")
             with patch.object(insights.warehouse, "get_db_path", lambda: path):
                 self.assertIsNone(compact_warehouse())
 
+    # @feature data-store.compaction
     def test_compaction_rebuilds_the_file_and_keeps_data(self):
         with self.warehouse_file() as (db, path):
             db.raw_sql('create schema "s"')

@@ -1,5 +1,6 @@
 import frappe
 
+from insights import user_permissions
 from insights.decorators import insights_whitelist
 from insights.insights.doctype.insights_data_source_v3.ibis_utils import (
     execute_ibis_query,
@@ -9,11 +10,16 @@ from insights.insights.doctype.insights_data_source_v3.ibis_utils import (
 from insights.insights.doctype.insights_table_link_v3.insights_table_link_v3 import (
     InsightsTableLinkv3,
 )
-from insights.insights.doctype.insights_table_v3.insights_table_v3 import InsightsTablev3
+from insights.insights.doctype.insights_table_v3.insights_table_v3 import (
+    InsightsTablev3,
+    get_stored_columns,
+)
 from insights.insights.doctype.insights_team.insights_team import (
     check_data_source_permission,
     check_table_permission,
 )
+from insights.not_permitted import answers_refusal
+from insights.permission_user import permission_user
 
 
 @insights_whitelist()
@@ -72,12 +78,19 @@ def get_permitted_ibis_table(data_source: str, table_name: str):
     instead of pulling the table into the data store. Everything else — team table
     restrictions, doctype row and column permissions — is what the query builder applies,
     and the preview must not show more than a query over the same table would return.
+
+    A table preview belongs to no chart, so it always runs as the caller. It
+    sets that here instead of relying on `get_permission_user`, which returns
+    the user of any enclosing execution.
     """
-    return InsightsTablev3.get_ibis_table(data_source, table_name, use_live_connection=True)
+    with permission_user(frappe.session.user):
+        return InsightsTablev3.get_ibis_table(data_source, table_name, use_live_connection=True)
 
 
 @insights_whitelist()
+@answers_refusal(lambda: {"columns": [], "rows": []})
 def get_data_source_table(data_source: str, table_name: str):
+    user_permissions.forget()
     q = get_permitted_ibis_table(data_source, table_name).head(100)
     data, _ = execute_ibis_query(q, cache_expiry=24 * 60 * 60)
 
@@ -86,17 +99,28 @@ def get_data_source_table(data_source: str, table_name: str):
         "data_source": data_source,
         "columns": get_columns_from_schema(q.schema()),
         "rows": data.to_dict(orient="records"),
+        # the table is read as the caller, so what narrowed it is theirs.
+        # Returned under the same keys as a card's
+        **user_permissions.scope(frappe.session.user),
     }
 
 
 @insights_whitelist()
 def get_data_source_table_row_count(data_source: str, table_name: str):
+    """How many rows the table has.
+
+    A refusal raises instead of returning a value. `answers_refusal` exists so
+    that a refused card does not read as zero. A count's empty value is zero,
+    and a number has no field to hold a refusal, so "0 rows" would tell a
+    caller who may not read the table that it is empty.
+    """
     table = get_permitted_ibis_table(data_source, table_name)
     result = table.count().execute()
     return int(result)
 
 
 @insights_whitelist()
+@answers_refusal(list)
 def get_data_source_table_columns(data_source: str, table_name: str):
     table = get_permitted_ibis_table(data_source, table_name)
     return [
@@ -109,7 +133,7 @@ def get_data_source_table_columns(data_source: str, table_name: str):
     ]
 
 
-@insights_whitelist()
+@insights_whitelist(methods=["POST"])
 def update_data_source_tables(data_source: str):
     check_data_source_permission(data_source)
     ds = frappe.get_doc("Insights Data Source v3", data_source)
@@ -183,9 +207,16 @@ def get_data_sources_of_tables(table_names: list[str]):
 
 @insights_whitelist()
 def get_schema(data_source: str):
+    """Every table of the data source, with its columns, as the caller may see it.
+
+    The sync writes each table's columns down, so a synced table costs nothing to
+    describe. A table synced before that is opened on the source, which is one
+    connection per table.
+    """
     check_data_source_permission(data_source)
 
     tables = get_data_source_tables(data_source)
+    stored = get_stored_columns(data_source)
     schema = {}
 
     for table in tables:
@@ -196,6 +227,14 @@ def get_schema(data_source: str):
             "data_source": data_source,
             "columns": [],
         }
+
+        if table.name in stored:
+            schema[table_name]["columns"] = [
+                frappe._dict(column=column["name"], label=column["name"], type=column["type"])
+                for column in stored[table.name].columns
+            ]
+            continue
+
         try:
             _table = get_permitted_ibis_table(data_source, table_name)
         except Exception:
