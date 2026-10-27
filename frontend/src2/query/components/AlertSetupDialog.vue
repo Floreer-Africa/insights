@@ -1,10 +1,11 @@
 <script setup lang="tsx">
-import { Textarea } from 'frappe-ui'
+import { Textarea, toast } from 'frappe-ui'
 import { computed, reactive, unref } from 'vue'
-import Checkbox from '../../components/Checkbox.vue'
+import Toggle from '../../components/Toggle.vue'
 import { waitUntil, wheneverChanges } from '../../helpers'
-import { createToast } from '../../helpers/toasts'
+import session from '../../session'
 import { __ } from '../../translation'
+import useUserStore from '../../users/users'
 import useAlertStore from '../alert'
 import { Query } from '../query'
 import ExpressionEditor from './ExpressionEditor.vue'
@@ -41,6 +42,20 @@ wheneverChanges(
 	{ deep: true },
 )
 
+const userStore = useUserStore()
+// Saving a new or disabled alert enables it. An alert runs as the user who
+// enabled it.
+const runsAs = computed(() => {
+	const enabler = alert.islocal || alert.doc.disabled ? '' : alert.doc.permission_user
+	if (!enabler || enabler === session.user.email) {
+		return __('Runs as you, so it sends the rows you can see.')
+	}
+	return __(
+		'Runs as {0}, so it sends the rows they can see.',
+		userStore.getName(enabler) || enabler,
+	)
+})
+
 const webhookError = computed(() => {
 	if (alert.doc.channel !== 'Webhook') return ''
 	const url = alert.doc.webhook_url?.trim()
@@ -76,12 +91,10 @@ function updateAlert() {
 	}
 	alert.doc.disabled = 0
 	return alert.save().then(() => {
-		createToast({
-			title: isNew ? __('Alert Created') : __('Alert Updated'),
-			message: isNew
+		toast.success(isNew ? __('Alert Created') : __('Alert Updated'), {
+			description: isNew
 				? __(`Alert "{0}" has been created.`, alert.doc.title)
 				: __(`Alert "{0}" has been updated.`, alert.doc.title),
-			variant: 'success',
 		})
 		show.value = false
 	})
@@ -93,10 +106,8 @@ function testSendAlert() {
 		alert.doc.query = props.query.doc.name
 	}
 	return alert.call('test_alert').then(() => {
-		createToast({
-			title: __('Alert Sent'),
-			message: __(`Alert "{0}" has been sent.`, alert.doc.title),
-			variant: 'success',
+		toast.success(__('Alert Sent'), {
+			description: __(`Alert "{0}" has been sent.`, alert.doc.title),
 		})
 	})
 }
@@ -104,12 +115,10 @@ function testSendAlert() {
 function toggleAlert() {
 	alert.doc.disabled = alert.doc.disabled ? 0 : 1
 	return alert.save().then(() => {
-		createToast({
-			title: alert.doc.disabled ? __('Alert Disabled') : __('Alert Enabled'),
-			message: alert.doc.disabled
+		toast.success(alert.doc.disabled ? __('Alert Disabled') : __('Alert Enabled'), {
+			description: alert.doc.disabled
 				? __(`Alert "{0}" has been disabled.`, alert.doc.title)
 				: __(`Alert "{0}" has been enabled.`, alert.doc.title),
-			variant: 'success',
 		})
 	})
 }
@@ -252,7 +261,7 @@ function toggleAlert() {
 							:column-options="props.query.result.columnOptions"
 						/>
 					</div>
-					<Checkbox
+					<Toggle
 						class="mt-1.5"
 						:label="__('Use Custom Condition')"
 						v-model="alert.doc.custom_condition"
@@ -289,6 +298,8 @@ Thanks,
 						/>
 					</div>
 				</div>
+
+				<p class="text-p-sm text-ink-gray-5">{{ runsAs }}</p>
 			</div>
 		</template>
 	</Dialog>

@@ -13,7 +13,7 @@ function dataRows(page: Page): Locator {
 
 /**
  * locator: a header cell is a <td data-column-name>. The two buttons inside it
- * are icon-only and carry no accessible name, so position inside the cell is
+ * are icon-only and have no accessible name, so position inside the cell is
  * the only handle. The first changes the column type, the last opens the menu.
  */
 function columnMenu(page: Page, column: string): Locator {
@@ -42,6 +42,7 @@ const ORDER_STATUS_FILTER = (status: string) => ({
 })
 
 test.describe('query', () => {
+	// @feature query.source-table query.interface-picker
 	test('a user picks a table as a query source and sees rows', async ({
 		page,
 		demoDataSource,
@@ -52,7 +53,7 @@ test.describe('query', () => {
 		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}`)
 
 		// The three interface cards are clickable divs with no role and no label,
-		// so getByText is the first rung of the ladder that reaches them.
+		// so getByText is the first level of the ladder that reaches them.
 		await page.getByText('Query Builder').click()
 
 		await page.getByRole('button', { name: `orders ${demoDataSource}` }).click()
@@ -70,6 +71,7 @@ test.describe('query', () => {
 		await expect(page.locator('tbody tr:has(td)')).toHaveCount(100)
 	})
 
+	// @feature query.filter query.reopen-operation
 	test('a user adds a filter and the row count falls', async ({
 		page,
 		demoDataSource,
@@ -88,7 +90,7 @@ test.describe('query', () => {
 		await page.getByRole('combobox', { name: 'Column' }).fill('order_status')
 		await page.getByRole('option', { name: 'order_status' }).click()
 
-		// The default operator for a text column is "is", which offers the
+		// The default operator for a text column is "is", which lists the
 		// distinct values of the column.
 		await page.getByRole('button', { name: 'Value' }).click()
 		await page.getByRole('option', { name: 'canceled' }).click()
@@ -99,8 +101,35 @@ test.describe('query', () => {
 		// 53 of the 2,000 demo orders are canceled.
 		await expect(dataRows(page)).toHaveCount(53)
 		await expect(page.getByRole('cell', { name: 'delivered', exact: true })).toHaveCount(0)
+
+		// A double-click on the step reopens its editor, filled with what was
+		// saved: the value control reads `canceled` rather than its placeholder.
+		// locator: an operation row is a plain div. Its own text is the only
+		// handle, and the same two words name the Filter step alone.
+		const filterStep = page
+			.locator('div.group')
+			.filter({ hasText: 'Filter' })
+			.filter({ hasText: 'order_status' })
+		await filterStep.dblclick()
+
+		const reopened = page.getByRole('dialog')
+		await reopened.getByRole('button', { name: 'canceled' }).click()
+		await page.getByRole('option', { name: 'shipped' }).click()
+		// The value list is a multi-select, so the rule keeps `canceled` until it
+		// is picked off again.
+		await page.getByRole('option', { name: 'canceled' }).click()
+		await page.keyboard.press('Escape')
+		await reopened.getByRole('button', { name: 'Apply Filters' }).click()
+
+		// 85 of the 2,000 demo orders are shipped. The pipeline still holds one
+		// Filter step, because the editor changed the step it was opened on.
+		await expect(dataRows(page)).toHaveCount(85)
+		await expect(page.getByRole('cell', { name: 'canceled', exact: true })).toHaveCount(0)
+		await expect(page.getByRole('cell', { name: 'shipped', exact: true })).not.toHaveCount(0)
+		await expect(filterStep).toHaveCount(1)
 	})
 
+	// @feature query.summarize query.summarize-grain
 	test('a user adds a summarize and the grain changes', async ({
 		page,
 		demoDataSource,
@@ -141,6 +170,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: '1,778' })).toBeVisible()
 	})
 
+	// @feature query.join
 	test('a user joins a second table and sees its columns', async ({
 		page,
 		demoDataSource,
@@ -172,6 +202,7 @@ test.describe('query', () => {
 		await expect(dataRows(page)).toHaveCount(100)
 	})
 
+	// @feature query.mutate query.mutate-inline
 	test('a user adds a mutate with an expression and sees the new column', async ({
 		page,
 		demoDataSource,
@@ -186,7 +217,7 @@ test.describe('query', () => {
 		await page.getByRole('button', { name: 'Add New Column' }).click()
 
 		// locator: the expression editor is CodeMirror, and its input is a
-		// contenteditable div. The dialog's Column Name field carries the same
+		// contenteditable div. The dialog's Column Name field has the same
 		// textbox role, so only the editor class separates the two.
 		await page.locator('.cm-content').fill('order_status.upper()')
 		await page.getByLabel('Column Name').fill('shout')
@@ -194,8 +225,29 @@ test.describe('query', () => {
 
 		await expect(page.getByRole('cell', { name: 'shout' })).toBeVisible()
 		await expect(page.getByRole('cell', { name: 'DELIVERED' })).not.toHaveCount(0)
+
+		// The empty column at the end of the grid is the second way in. It takes
+		// an expression and nothing else, so the column it writes is named
+		// `new_column` and typed from the expression.
+		// locator: the `+` that opens it, and the tick that confirms it, are
+		// icon-only Buttons that pass no label. The lucide class on each icon
+		// is the only name they have, and the header row is what keeps
+		// the match off the toolbar's own `+`.
+		await page.locator('thead button:has(svg.lucide-plus)').click()
+		// locator: the inline expression editor is CodeMirror. Its own class is
+		// what separates it from the editor the dialog above opened.
+		await page.locator('.inline-expression .cm-content').fill('order_status.length()')
+		await page.locator('thead button:has(svg.lucide-check)').click()
+
+		await expect(page.getByRole('cell', { name: 'new_column' })).toBeVisible()
+		// A mutate adds a column and touches no row, so the page still holds 100.
+		await expect(dataRows(page)).toHaveCount(100)
+		// locator: an operation row is a plain div holding its own words. Both
+		// calculated columns are now steps of the pipeline.
+		await expect(page.locator('div.group').filter({ hasText: 'Calculate' })).toHaveCount(2)
 	})
 
+	// @feature query.step-back
 	test('a user steps back to an earlier operation and the results rewind', async ({
 		page,
 		adminApi,
@@ -218,6 +270,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'delivered' })).not.toHaveCount(0)
 	})
 
+	// @feature query.remove-operation
 	test('a user removes an operation mid-pipeline', async ({
 		page,
 		adminApi,
@@ -258,12 +311,13 @@ test.describe('query', () => {
 	/**
 	 * Renaming and removing are two flows, not one.
 	 *
-	 * Each one edits the query, and each edit redraws the results twice: once
+	 * Each one edits the query, and each edit re-renders the results twice: once
 	 * when the new rows arrive, once when the save answer replaces the document.
-	 * A second edit made across either redraw is lost, and an open column menu
+	 * A second edit made across either re-render is lost, and an open column menu
 	 * closes under it. See "Never wait in the middle of an edit" in AGENTS.md.
 	 * One edit per flow, on a page that has gone quiet, has neither problem.
 	 */
+	// @feature query.rename-column
 	test('a user renames a column', async ({ page, demoDataSource, workbookWithQuery }) => {
 		const { workbook, query } = workbookWithQuery
 		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}/query/${query.name}`)
@@ -278,6 +332,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'order_status' })).toHaveCount(0)
 	})
 
+	// @feature query.remove-column
 	test('a user removes a column', async ({ page, demoDataSource, workbookWithQuery }) => {
 		const { workbook, query } = workbookWithQuery
 		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}/query/${query.name}`)
@@ -298,6 +353,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'order_approved_at' })).toHaveCount(0)
 	})
 
+	// @feature query.cast-column
 	test('a user casts a column type', async ({ page, adminApi, demoDataSource, workbook }) => {
 		const query = await createQuery(adminApi, {
 			workbook: workbook.name,
@@ -320,6 +376,7 @@ test.describe('query', () => {
 		await expect(dataRows(page)).toHaveCount(100)
 	})
 
+	// @feature query.order-by
 	test('a user sorts by a column', async ({ page, demoDataSource, workbookWithQuery }) => {
 		const { workbook, query } = workbookWithQuery
 		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}/query/${query.name}`)
@@ -334,6 +391,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'ORD-00001' })).toHaveCount(0)
 	})
 
+	// @feature query.filter-relative-date
 	test('a user filters on a date with the relative date picker', async ({
 		page,
 		demoDataSource,
@@ -352,7 +410,7 @@ test.describe('query', () => {
 		await page.getByRole('option', { name: 'order_purchase_timestamp' }).click()
 
 		// locator: the operator control is a listbox, not a native select, and it
-		// carries no label. The row wraps it in a div with a stable id.
+		// has no label. The row wraps it in a div with a stable id.
 		await page.locator('#operator').getByRole('combobox').click()
 		await page.getByRole('option', { name: 'within' }).click()
 
@@ -365,13 +423,16 @@ test.describe('query', () => {
 
 		await page.getByRole('button', { name: 'Apply Filters' }).click()
 
-		// The demo orders stop in 2018, so the last year holds none of them. The
-		// table keeps its headers and drops every row.
+		// The demo orders stop in 2018, so the last year holds none of them. A
+		// result with no rows renders no table at all, headers included, so what
+		// the editor shows is the empty state and the count behind it.
 		await expect(dataRows(page)).toHaveCount(0)
-		await expect(page.getByRole('cell', { name: 'order_status' })).toBeVisible()
+		await expect(page.getByText('No data to display.')).toBeVisible()
+		await expect(page.getByText('Showing 0 rows')).toBeVisible()
 		await expect(page.getByText('Filter', { exact: true })).toBeVisible()
 	})
 
+	// @feature query.native-sql query.interface-picker query.native-sql-schema-explorer
 	test('a user writes a native SQL query and runs it', async ({
 		page,
 		demoDataSource,
@@ -385,12 +446,26 @@ test.describe('query', () => {
 		await page.getByRole('button', { name: 'Select a data source' }).click()
 		await page.getByRole('option', { name: 'Demo Data' }).click()
 
+		// The schema explorer beside the editor writes names into it. A table name
+		// is a button of its own; the row around it is what opens the table.
 		// locator: the SQL editor is CodeMirror, and its input is a contenteditable
-		// div. The Query Title field carries the same textbox role, so only the
+		// div. The Query Title field has the same textbox role, so only the
 		// editor class separates the two.
-		await page
-			.locator('.cm-content')
-			.fill('select order_status from orders group by order_status')
+		const editor = page.locator('.cm-content')
+		await page.getByPlaceholder('Search tables and columns...').fill('orders')
+		await page.getByRole('button', { name: 'orders', exact: true }).click()
+		await expect(editor).toContainText('`orders`')
+
+		// locator: the row that expands a table is a plain div, and the name
+		// inside it stops the click before it reaches the row. The row is named
+		// by the button it holds, and the chevron has only its lucide class.
+		await page.locator('div:has(> button:text-is("orders"))').locator('svg').first().click()
+		// A column button reads its name and then its type, so the match is on
+		// the name it starts with.
+		await page.getByRole('button', { name: /^order_status/ }).click()
+		await expect(editor).toContainText('`order_status`')
+
+		await editor.fill('select order_status from orders group by order_status')
 		await page.getByRole('button', { name: 'Execute' }).click()
 
 		await expect(page.getByRole('cell', { name: 'order_status' })).toBeVisible()
@@ -398,6 +473,7 @@ test.describe('query', () => {
 		await expect(dataRows(page)).toHaveCount(6)
 	})
 
+	// @feature query.pivot-wider
 	test('a user pivots wider', async ({ page, adminApi, demoDataSource, workbook }) => {
 		const query = await createQuery(adminApi, {
 			workbook: workbook.name,
@@ -444,6 +520,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'voucher' })).toBeVisible()
 	})
 
+	// @feature query.union
 	test('a user unions two queries', async ({ page, adminApi, demoDataSource, workbook }) => {
 		const unavailable = await createQuery(adminApi, {
 			workbook: workbook.name,
@@ -475,6 +552,7 @@ test.describe('query', () => {
 		await expect(page.getByRole('cell', { name: 'unavailable' })).not.toHaveCount(0)
 	})
 
+	// @feature query.view-sql
 	test('a user opens View SQL and sees compiled SQL', async ({
 		page,
 		demoDataSource,
@@ -498,5 +576,46 @@ test.describe('query', () => {
 		// the editor body is the only node that holds the whole text.
 		await expect(dialog.locator('.cm-content')).toContainText('orders')
 		await expect(dialog.locator('.cm-content')).toContainText(/select/i)
+	})
+
+	// @feature query.filter-from-column-header
+	test('a user filters from a column header and the rows narrow', async ({
+		page,
+		demoDataSource,
+		workbookWithQuery,
+	}) => {
+		const { workbook, query } = workbookWithQuery
+		await page.goto(`${INSIGHTS_PATH}/workbook/${workbook.name}/query/${query.name}`)
+
+		await expect(page.getByRole('cell', { name: 'order_status' })).toBeVisible()
+		await expect(dataRows(page)).toHaveCount(100)
+
+		await columnMenu(page, 'order_status').click()
+		await page.getByRole('button', { name: 'Filter', exact: true }).click()
+
+		// locator: the filter panel is portaled to <body> by reka and marked only
+		// on its wrapper, so nothing inside it is reachable from the trigger. Its
+		// own value search is what tells it from the menu it opened over.
+		const panel = page.locator('[data-reka-popper-content-wrapper]', {
+			has: page.getByPlaceholder('Search'),
+		})
+		// The operator opens on "is", which lists the distinct values of the
+		// column. A value is a plain row, not an option.
+		await panel.getByText('canceled', { exact: true }).click()
+		// locator: the panel's confirm is icon-only and passes no label, so
+		// frappe-ui renders it with no accessible name. Its lucide icon class is
+		// the name.
+		await panel.locator('button:has(span.lucide-check)').click()
+
+		// 53 of the 2,000 demo orders are canceled, and the pipeline gained the
+		// Filter step the header wrote.
+		await expect(dataRows(page)).toHaveCount(53)
+		await expect(page.getByRole('cell', { name: 'delivered', exact: true })).toHaveCount(0)
+		await expect(
+			page
+				.locator('div.group')
+				.filter({ hasText: 'Filter' })
+				.filter({ hasText: 'order_status' }),
+		).toHaveCount(1)
 	})
 })
